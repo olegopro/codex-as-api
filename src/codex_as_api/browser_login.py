@@ -17,6 +17,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from .auth import CHATGPT_OAUTH_CLIENT_ID, AuthDurabilityUnknownError
 from .device_login import TOKEN_URL, Commit, LoginError, Transport, _Attempt, _object, _string, default_transport
@@ -34,9 +35,25 @@ class _BrowserAttempt(_Attempt):
     expiry_task: asyncio.Task[None] | None = None
     handlers: set[asyncio.Task[None]] = field(default_factory=set)
     accepted: bool = False
+    profile_data: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def public(self) -> dict[str, object]:
         return {**super().public(), "method": "browser"}
+
+
+class BrowserLoginProfile(Protocol):
+    """Профиль меняет только параметры обмена, сохраняя общий цикл входа."""
+
+    authorize_url: str
+    token_url: str
+
+    async def authorization_parameters(self, attempt: _BrowserAttempt) -> dict[str, str]: ...
+
+    async def exchange_parameters(
+        self, attempt: _BrowserAttempt, query: dict[str, list[str]]
+    ) -> dict[str, str]: ...
+
+    def token_payload(self, attempt: _BrowserAttempt, payload: dict[str, object]) -> dict[str, Any]: ...
 
 
 class BrowserLoginManager:
@@ -45,10 +62,11 @@ class BrowserLoginManager:
                  now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                  lifetime: float = 900.0, max_records: int = 32,
-                 ports: tuple[int, ...] = (1455, 1457)):
+                 ports: tuple[int, ...] = (1455, 1457), profile: BrowserLoginProfile | None = None):
         if lifetime <= 0 or max_records < 1 or not ports:
             raise ValueError("invalid login manager settings")
         self._commit, self._transport = commit, transport
+        self._profile = profile
         self._monotonic, self._now, self._sleep = monotonic, now, sleep
         self._lifetime, self._max_records, self._ports = lifetime, max_records, ports
         self._records: OrderedDict[str, _BrowserAttempt] = OrderedDict()
@@ -96,12 +114,22 @@ class BrowserLoginManager:
             attempt.redirect_uri = f"http://127.0.0.1:{bound}/auth/callback"
             digest = hashlib.sha256(attempt.verifier.encode()).digest()
             challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-            query = urllib.parse.urlencode({"response_type": "code", "client_id": CHATGPT_OAUTH_CLIENT_ID,
+            parameters = {"response_type": "code", "client_id": CHATGPT_OAUTH_CLIENT_ID,
                 "redirect_uri": attempt.redirect_uri, "state": attempt.state, "code_challenge": challenge,
                 "code_challenge_method": "S256", "scope": SCOPES, "id_token_add_organizations": "true",
-                "codex_cli_simplified_flow": "true", "originator": "codex_cli_rs"})
+                "codex_cli_simplified_flow": "true", "originator": "codex_cli_rs"}
+            if self._profile is not None:
+                profile_parameters = await asyncio.wait_for(self._profile.authorization_parameters(attempt),
+                    max(0, attempt.deadline - self._monotonic()))
+                parameters = {"response_type": "code", "redirect_uri": attempt.redirect_uri,
+                    "state": attempt.state, "code_challenge": challenge, "code_challenge_method": "S256",
+                    **profile_parameters}
+                if self._closed or attempt.cancel_requested or self._monotonic() >= attempt.deadline:
+                    raise LoginError("login_unavailable")
+            query = urllib.parse.urlencode(parameters)
             attempt.expiry_task = asyncio.create_task(self._expire(attempt))
-            return {**attempt.public(), "auth_url": AUTHORIZE_URL + "?" + query}
+            authorize_url = self._profile.authorize_url if self._profile is not None else AUTHORIZE_URL
+            return {**attempt.public(), "auth_url": authorize_url + "?" + query}
         except BaseException:
             self._finish(attempt, "cancelled" if attempt.cancel_requested else "failed")
             raise
@@ -171,15 +199,24 @@ class BrowserLoginManager:
                 await self._reply(writer, False)
                 return
             attempt.task = asyncio.current_task()
-            body = urllib.parse.urlencode({"grant_type": "authorization_code", "client_id": CHATGPT_OAUTH_CLIENT_ID,
-                "code": codes[0], "redirect_uri": attempt.redirect_uri, "code_verifier": attempt.verifier}).encode()
+            parameters = {"grant_type": "authorization_code", "client_id": CHATGPT_OAUTH_CLIENT_ID,
+                "code": codes[0], "redirect_uri": attempt.redirect_uri, "code_verifier": attempt.verifier}
+            if self._profile is not None:
+                profile_parameters = await asyncio.wait_for(self._profile.exchange_parameters(attempt, query),
+                    max(0, attempt.deadline - self._monotonic()))
+                parameters = {"grant_type": "authorization_code", "code": codes[0],
+                    "redirect_uri": attempt.redirect_uri, "code_verifier": attempt.verifier,
+                    **profile_parameters}
+            body = urllib.parse.urlencode(parameters).encode()
             remaining = attempt.deadline - self._monotonic()
-            status, data = await asyncio.wait_for(self._transport(TOKEN_URL, body,
+            token_url = self._profile.token_url if self._profile is not None else TOKEN_URL
+            status, data = await asyncio.wait_for(self._transport(token_url, body,
                 {"Content-Type": "application/x-www-form-urlencoded"}, remaining), remaining)
             if not 200 <= status < 300:
                 raise LoginError("login_upstream_error")
             payload = _object(data)
-            tokens = {key: _string(payload, key) for key in ("access_token", "refresh_token", "id_token")}
+            tokens = (self._profile.token_payload(attempt, payload) if self._profile is not None
+                else {key: _string(payload, key) for key in ("access_token", "refresh_token", "id_token")})
             def guard() -> bool:
                 with attempt.claim_lock:
                     if (self._closed or attempt.cancel_requested or self._active is not attempt

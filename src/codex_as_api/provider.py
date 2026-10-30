@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -15,15 +17,19 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, NoReturn, cast
+
+import httpx
 
 from . import __version__
 from .auth import (
     ChatGPTOAuthCatalogUnavailableError,
     ChatGPTOAuthError,
     ChatGPTOAuthInvalidRequestError,
+    ChatGPTOAuthMissingError,
     ChatGPTOAuthProtocolError,
     ChatGPTOAuthRefreshError,
     ChatGPTOAuthUpstreamError,
@@ -64,6 +70,7 @@ from .model_capabilities import (
     build_codex_client_metadata,
     resolve_codex_metadata_enabled,
     resolve_model,
+    resolve_responses_lite_mode,
     use_responses_lite,
     validate_model_capability_environment,
 )
@@ -76,6 +83,13 @@ from .reasoning_signature import extract_reasoning_item_for_model
 from .strict_json import strict_json_loads
 
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
+SIWC_BASE_URL = "https://api.openai.com/v1"
+BACKEND_ENV = "CODEX_AS_API_BACKEND"
+SIWC_TOOL_NAMESPACE = "codex_as_api"
+_SIWC_PAYLOAD_FIELDS = frozenset({
+    "model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls",
+    "stream", "store", "include", "reasoning", "text", "service_tier", "prompt_cache_key",
+})
 CHATGPT_OAUTH_DEFAULT_TIMEOUT = 300.0
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
 CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION"
@@ -247,6 +261,7 @@ class PreparedChatRequest:
     replay_input: tuple[dict[str, Any], ...]
     snapshot: ModelCatalogSnapshot
     capability: ModelCapability
+    tool_names: dict[str, str] = field(default_factory=dict)
 
 
 class _TransportHeaders(dict[str, str]):
@@ -432,6 +447,40 @@ def codex_session_headers(payload: dict[str, Any]) -> dict[str, str]:
     return {"session-id": session_id, "thread-id": thread_id, "x-client-request-id": thread_id}
 
 
+def resolve_backend(value: str | None = None) -> str:
+    backend = os.getenv(BACKEND_ENV, "codex") if value is None else value
+    if backend not in {"codex", "siwc"}:
+        raise ValueError(f"{BACKEND_ENV}: допускаются только codex и siwc")
+    return backend
+
+
+class _HTTPXResponse:
+    """Публичный HTTP-поток подключается к существующему SSE-декодеру."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.headers = response.headers
+        self._response = response
+        self._chunks = response.iter_bytes()
+        self._buffer = b""
+
+    def readline(self) -> bytes:
+        while b"\n" not in self._buffer:
+            chunk = next(self._chunks, b"")
+            if not chunk:
+                line, self._buffer = self._buffer, b""
+                return line
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line + b"\n"
+
+    def read(self) -> bytes:
+        body, self._buffer = self._buffer + b"".join(self._chunks), b""
+        return body
+
+    def close(self) -> None:
+        self._response.close()
+
+
 class ChatGPTOAuthProvider:
     name: str = "chatgpt_oauth"
     provider_namespace: str = "agent.provider.chatgpt_oauth"
@@ -441,16 +490,20 @@ class ChatGPTOAuthProvider:
         self,
         *,
         model: str | None = None,
-        base_url: str = CHATGPT_OAUTH_DEFAULT_BASE_URL,
+        base_url: str | None = None,
+        backend: str | None = None,
+        http_client: httpx.Client | None = None,
         auth_json_path: str | None = None,
         timeout: float | None = None,
         catalog_timeout: float | None = None,
         catalog_ttl: float | None = None,
         version_resolver: CodexVersionResolver | CodexVersionProvider | None = None,
     ) -> None:
-        validate_codex_cli_version_environment()
-        validate_auth_environment()
-        validate_model_capability_environment()
+        self.backend = resolve_backend(backend)
+        if self.backend == "codex":
+            validate_codex_cli_version_environment()
+            validate_auth_environment()
+            validate_model_capability_environment()
         if version_resolver is not None and not (
             isinstance(version_resolver, CodexVersionResolver) or callable(version_resolver)
         ):
@@ -462,8 +515,19 @@ class ChatGPTOAuthProvider:
         if auth_json_path is not None and not auth_json_path.strip():
             raise ValueError("auth_json_path must be a non-empty string")
         self.model = model
-        self.base_url = _normalize_base_url(base_url)
-        self.auth_json_path = auth_json_path
+        if self.backend == "siwc":
+            if base_url is not None and base_url != SIWC_BASE_URL:
+                raise ValueError("SIWC допускает только https://api.openai.com/v1")
+            self.base_url = SIWC_BASE_URL
+        else:
+            self.base_url = _normalize_base_url(CHATGPT_OAUTH_DEFAULT_BASE_URL if base_url is None else base_url)
+        self._http_client = http_client
+        self.auth_json_path: str | None
+        if self.backend == "siwc":
+            from .siwc_auth import resolve_auth_path as resolve_siwc_auth_path
+            self.auth_json_path = os.fspath(resolve_siwc_auth_path(auth_json_path))
+        else:
+            self.auth_json_path = auth_json_path
         self.timeout = (
             CHATGPT_OAUTH_DEFAULT_TIMEOUT if timeout is None else _validate_positive_finite(timeout, "timeout")
         )
@@ -487,7 +551,71 @@ class ChatGPTOAuthProvider:
         self._response_chains = _ResponseChainStore()
 
     def _resolve_client_version(self) -> str:
+        if self.backend == "siwc":
+            return "siwc"
         return resolve_codex_cli_version(self._version_resolver)
+
+    def _require_token_profile(self, token: Any) -> None:
+        if getattr(token, "oauth_profile", "codex") != self.backend:
+            raise ChatGPTOAuthMissingError("Профиль OAuth не соответствует выбранному backend")
+
+    def _token_for_request(self) -> Any:
+        token = (
+            token_for_request(self.auth_json_path, expected_profile="siwc")
+            if self.backend == "siwc"
+            else token_for_request(self.auth_json_path)
+        )
+        self._require_token_profile(token)
+        return token
+
+    def _refresh_after_unauthorized(self, token: Any) -> Any:
+        self._require_token_profile(token)
+        refreshed = (
+            refresh_after_unauthorized(token, expected_profile="siwc")
+            if self.backend == "siwc"
+            else refresh_after_unauthorized(token)
+        )
+        self._require_token_profile(refreshed)
+        return refreshed
+
+    @contextmanager
+    def _open_request(self, request: urllib.request.Request, *, timeout: float) -> Iterator[Any]:
+        if self.backend != "siwc":
+            with _urlopen_no_redirect(request, timeout=timeout) as response:
+                yield response
+            return
+        if self.base_url != SIWC_BASE_URL or request.full_url not in {
+            f"{SIWC_BASE_URL}/models", f"{SIWC_BASE_URL}/responses",
+        }:
+            raise ChatGPTOAuthInvalidRequestError("Адрес запроса не входит в публичный контракт SIWC")
+        content = request.data
+        if content is not None and not isinstance(content, bytes):
+            raise ChatGPTOAuthInvalidRequestError("Тело публичного запроса должно содержать байты JSON")
+        client = self._http_client or httpx.Client(trust_env=False)
+        response = None
+        try:
+            public_request = httpx.Request(
+                request.get_method(), request.full_url,
+                headers=dict(request.header_items()), content=content,
+                extensions={"timeout": dict.fromkeys(("connect", "read", "write", "pool"), timeout)},
+            )
+            response = client.send(public_request, stream=True, auth=None, follow_redirects=False)
+            if response.status_code >= 300:
+                error_headers = http.client.HTTPMessage()
+                for key, value in response.headers.items():
+                    error_headers[key] = value
+                raise urllib.error.HTTPError(
+                    request.full_url, response.status_code, "Ошибка публичного API",
+                    error_headers, io.BytesIO(response.read()),
+                )
+            yield _HTTPXResponse(response)
+        except httpx.HTTPError as exc:
+            raise OSError(str(exc)) from exc
+        finally:
+            if response is not None:
+                response.close()
+            if self._http_client is None:
+                client.close()
 
     def cancel_current_requests(self) -> None:
         with self._active_response_lock:
@@ -504,13 +632,14 @@ class ChatGPTOAuthProvider:
             ) from failures[0]
 
     def get_model_catalog(self) -> ModelCatalogSnapshot:
-        token = token_for_request(self.auth_json_path)
+        token = self._token_for_request()
         version = self._resolve_client_version()
         key = (token.account_id, self.base_url, version)
         return self._model_catalog_cache.get(
             key,
             lambda: self._fetch_model_catalog(token, version),
             ttl_seconds=self.catalog_ttl,
+            backend=self.backend,
         )
 
     def resolve_model(
@@ -538,10 +667,11 @@ class ChatGPTOAuthProvider:
         initial_account_id = initial_token.account_id
         token_values: tuple[str | None, ...] = (None,)
         query = urllib.parse.urlencode({"client_version": version})
-        url = f"{self.base_url}/models?{query}"
+        url = f"{self.base_url}/models" + (f"?{query}" if self.backend == "codex" else "")
         for attempt in range(2):
             headers = self._headers(token, client_version=version)
-            headers["Accept"] = "application/json"
+            if self.backend == "codex":
+                headers["Accept"] = "application/json"
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             request = urllib.request.Request(url, headers=headers, method="GET")
             deadline = time.monotonic() + self.catalog_timeout
@@ -549,7 +679,7 @@ class ChatGPTOAuthProvider:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("model catalog request exceeded its total deadline")
-                with _urlopen_no_redirect(request, timeout=remaining) as response:
+                with self._open_request(request, timeout=remaining) as response:
                     try:
                         document = strict_json_loads(_read_response_before_deadline(response, deadline))
                     except (UnicodeDecodeError, ValueError) as exc:
@@ -563,7 +693,7 @@ class ChatGPTOAuthProvider:
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and attempt == 0:
                     exc.close()
-                    token = refresh_after_unauthorized(token)
+                    token = self._refresh_after_unauthorized(token)
                     if token.account_id != initial_account_id:
                         raise ChatGPTOAuthRefreshError(
                             "authenticated account changed during model catalog refresh"
@@ -843,6 +973,8 @@ class ChatGPTOAuthProvider:
             payload,
             extra_headers=extra_headers,
         )
+        if self.backend == "siwc":
+            stream = _siwc_response_events(stream)
         final_output: list[dict[str, Any]] = []
         reasoning_summary_parts: list[str] = []
         reasoning_raw_parts: list[str] = []
@@ -942,8 +1074,8 @@ class ChatGPTOAuthProvider:
                     current_item_raw_parts = []
                     saw_current_item_summary_delta = False
                     saw_current_item_raw_delta = False
-                tool = _tool_call_from_response_item(item)
-                if tool is not None:
+                tool = _tool_call_for_prepared_request(item, prepared, backend=self.backend)
+                if tool is not None and self.backend != "siwc":
                     if tool.id in yielded_tool_call_ids:
                         raise ChatGPTOAuthProtocolError(
                             f"provider response contains duplicate call_id {tool.id!r}"
@@ -1040,9 +1172,20 @@ class ChatGPTOAuthProvider:
                 response = _validated_completed_response(event)
                 usage = response.get("usage")
                 _usage_from_response(usage)
+                if self.backend == "siwc":
+                    completed_output = response.get("output")
+                    if not isinstance(completed_output, list):
+                        raise ChatGPTOAuthProtocolError("response.completed: отсутствует массив output")
+                    for item in completed_output:
+                        if not isinstance(item, dict):
+                            raise ChatGPTOAuthProtocolError("response.completed.output: ожидаются объекты")
+                        _validate_response_output_item(item)
+                    if final_output and final_output != completed_output:
+                        raise ChatGPTOAuthProtocolError("Завершённый output не совпадает с элементами потока")
+                    final_output = deepcopy(completed_output)
                 display_output = deepcopy(final_output)
                 for item in display_output:
-                    tool = _tool_call_from_response_item(item)
+                    tool = _tool_call_for_prepared_request(item, prepared, backend=self.backend)
                     if tool is not None and tool.id not in yielded_tool_call_ids:
                         yielded_tool_call_ids.add(tool.id)
                         saw_function_tool_call = True
@@ -1125,6 +1268,8 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> list[dict[str, Any]]:
+        if self.backend == "siwc":
+            raise ChatGPTOAuthInvalidRequestError("Генерация изображений не поддерживается SIWC preview")
         if not isinstance(prompt, str) or prompt.strip() == "":
             raise ChatGPTOAuthInvalidRequestError("image generation prompt is required")
         content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -1183,6 +1328,10 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> str:
+        if self.backend == "siwc":
+            if responses_lite is not None and resolve_responses_lite_mode(responses_lite) == "on":
+                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным SIWC")
+            responses_lite = False
         if not isinstance(prompt, str) or prompt.strip() == "":
             raise ChatGPTOAuthInvalidRequestError("image inspection prompt is required")
         content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -1225,14 +1374,19 @@ class ChatGPTOAuthProvider:
     ) -> list[dict[str, Any]]:
         output_items: list[dict[str, Any]] = []
 
-        for event in self._post_sse(
+        if self.backend == "siwc":
+            _prepare_siwc_tools(payload)
+        stream = self._post_sse(
             "/responses",
             payload,
             extra_headers=_responses_transport_headers(
                 payload,
                 catalog_key=catalog_key,
             ),
-        ):
+        )
+        if self.backend == "siwc":
+            stream = _siwc_response_events(stream)
+        for event in stream:
             _validate_response_event(event)
             typ = event.get("type")
             if typ == "response.output_item.done":
@@ -1273,6 +1427,8 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> str:
+        if self.backend == "siwc":
+            raise ChatGPTOAuthInvalidRequestError("/responses/compact не подтверждён для SIWC OAuth и отключён")
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
         base_instructions, input_items = _split_instructions_and_input(
@@ -1421,6 +1577,14 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> PreparedChatRequest:
+        if self.backend == "siwc":
+            if codex_metadata is True:
+                raise ChatGPTOAuthInvalidRequestError("Codex metadata не поддерживается публичным SIWC")
+            if responses_lite is not None and resolve_responses_lite_mode(responses_lite) == "on":
+                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным SIWC")
+            responses_lite = False
+            codex_metadata = False
+            client_metadata = None
         if temperature is not None:
             raise ChatGPTOAuthInvalidRequestError("temperature is not supported by the ChatGPT Codex OAuth transport")
         if max_tokens is not None:
@@ -1501,11 +1665,15 @@ class ChatGPTOAuthProvider:
             safety_identifier=safety_identifier,
             prompt_cache_options=prompt_cache_options,
         )
+        tool_names = _prepare_siwc_tools(payload) if self.backend == "siwc" else {}
+        if self.backend == "siwc":
+            _validate_siwc_wire_payload(payload)
         return PreparedChatRequest(
             payload=payload,
-            replay_input=tuple(deepcopy(input_items)),
+            replay_input=tuple(deepcopy(payload["input"] if self.backend == "siwc" else input_items)),
             snapshot=snapshot,
             capability=capability,
+            tool_names=tool_names,
         )
 
     def _headers(
@@ -1514,7 +1682,10 @@ class ChatGPTOAuthProvider:
         *,
         client_version: str | None = None,
     ) -> dict[str, str]:
-        token = token or token_for_request(self.auth_json_path)
+        token = token or self._token_for_request()
+        self._require_token_profile(token)
+        if self.backend == "siwc":
+            return {"Authorization": f"Bearer {token.access_token}", "Content-Type": "application/json"}
         resolved_version = self._resolve_client_version() if client_version is None else client_version
         headers = {
             **codex_cli_headers_for_version(resolved_version),
@@ -1577,13 +1748,16 @@ class ChatGPTOAuthProvider:
             catalog_key[2] if catalog_key is not None else self._resolve_client_version()
         )
         for attempt in range(2):
-            token = token_for_request(self.auth_json_path)
+            token = self._token_for_request()
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
-            headers["Accept"] = "text/event-stream"
-            headers.update(codex_session_headers(payload))
-            if extra_headers:
-                headers.update(extra_headers)
+            if self.backend == "codex":
+                headers["Accept"] = "text/event-stream"
+                headers.update(codex_session_headers(payload))
+                if extra_headers:
+                    headers.update(extra_headers)
+            else:
+                _validate_siwc_wire_payload(payload)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             req = urllib.request.Request(
                 self.base_url + path,
@@ -1593,7 +1767,7 @@ class ChatGPTOAuthProvider:
             )
             error_deadline = time.monotonic() + self.timeout
             try:
-                with _urlopen_no_redirect(req, timeout=self.timeout) as response:
+                with self._open_request(req, timeout=self.timeout) as response:
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,
@@ -1607,7 +1781,7 @@ class ChatGPTOAuthProvider:
                             raw_line = response.readline()
                             if raw_line == b"":
                                 if block:
-                                    event = _decode_sse_block(block)
+                                    event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
                                     if event is not None:
                                         if event.get("type") in {
                                             "error",
@@ -1624,7 +1798,7 @@ class ChatGPTOAuthProvider:
                                     "ChatGPT OAuth SSE response was not valid UTF-8"
                                 ) from exc
                             if line == "":
-                                event = _decode_sse_block(block)
+                                event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
                                 block = []
                                 if event is not None:
                                     if event.get("type") in {
@@ -1642,7 +1816,7 @@ class ChatGPTOAuthProvider:
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and attempt == 0:
                     exc.close()
-                    refresh_after_unauthorized(token)
+                    self._refresh_after_unauthorized(token)
                     continue
                 redacted = _http_error_body(exc, token_values, deadline=error_deadline)
                 raise ChatGPTOAuthUpstreamError(
@@ -1665,12 +1839,14 @@ class ChatGPTOAuthProvider:
         extra_headers: dict[str, str] | None = None,
         catalog_key: CatalogKey | None = None,
     ) -> bytes:
+        if self.backend == "siwc":
+            raise ChatGPTOAuthInvalidRequestError("Нестримовый upstream и /responses/compact не поддерживаются SIWC")
         token_values: tuple[str | None, ...] = (None,)
         resolved_client_version = (
             catalog_key[2] if catalog_key is not None else self._resolve_client_version()
         )
         for attempt in range(2):
-            token = token_for_request(self.auth_json_path)
+            token = self._token_for_request()
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
             headers.update(codex_session_headers(payload))
@@ -1698,7 +1874,7 @@ class ChatGPTOAuthProvider:
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and attempt == 0:
                     exc.close()
-                    refresh_after_unauthorized(token)
+                    self._refresh_after_unauthorized(token)
                     continue
                 redacted = _http_error_body(exc, token_values, deadline=deadline)
                 raise ChatGPTOAuthUpstreamError(
@@ -1713,6 +1889,159 @@ class ChatGPTOAuthProvider:
                     f"ChatGPT OAuth transport failed: {redact_text(str(exc), *token_values)}",
                 ) from exc
         raise AssertionError("unreachable ChatGPT OAuth request retry state")
+
+
+def _siwc_wire_name(name: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
+        return name
+    return "fn_" + hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
+def _prepare_siwc_tools(payload: dict[str, Any]) -> dict[str, str]:
+    names: dict[str, str] = {}
+
+    def wire_name(original: Any) -> str:
+        if not isinstance(original, str) or not original:
+            raise ChatGPTOAuthInvalidRequestError("Имя функции должно быть непустой строкой")
+        wire = _siwc_wire_name(original)
+        if wire in names and names[wire] != original:
+            raise ChatGPTOAuthInvalidRequestError("Обнаружено совпадение публичных имён функций")
+        names[wire] = original
+        return wire
+
+    functions: list[dict[str, Any]] = []
+    hosted: list[dict[str, Any]] = []
+    for tool in payload.get("tools", []):
+        if tool.get("type") == "function":
+            functions.append({**tool, "name": wire_name(tool.get("name"))})
+        elif tool.get("type") == "web_search":
+            hosted.append(tool)
+        else:
+            raise ChatGPTOAuthInvalidRequestError("Тип инструмента не поддерживается SIWC preview")
+    choice = payload.get("tool_choice", "auto")
+    if isinstance(choice, dict):
+        if choice.get("type") != "function" or set(choice) != {"type", "name"}:
+            raise ChatGPTOAuthInvalidRequestError("Выбор инструмента не поддерживается SIWC preview")
+        selected = wire_name(choice.get("name"))
+        functions = [tool for tool in functions if tool["name"] == selected]
+        if not functions:
+            raise ChatGPTOAuthInvalidRequestError("Выбранная функция отсутствует в tools")
+        # Единственная доступная функция и required сохраняют принудительный выбор.
+        hosted = []
+        payload["tool_choice"] = "required"
+    elif choice not in {"auto", "none", "required"}:
+        raise ChatGPTOAuthInvalidRequestError("Недопустимый выбор инструмента SIWC")
+    payload["tools"] = hosted + ([{
+        "type": "namespace", "name": SIWC_TOOL_NAMESPACE, "tools": functions,
+    }] if functions else [])
+    for item in payload["input"]:
+        if item.get("type") == "function_call" and item.get("namespace") != SIWC_TOOL_NAMESPACE:
+            item["name"] = wire_name(item.get("name"))
+            item["namespace"] = SIWC_TOOL_NAMESPACE
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("summary") == "none":
+        reasoning.pop("summary")
+        if not reasoning:
+            payload.pop("reasoning")
+    return names
+
+
+def _validate_siwc_wire_payload(payload: dict[str, Any]) -> None:
+    unknown = set(payload) - _SIWC_PAYLOAD_FIELDS
+    if unknown:
+        raise ChatGPTOAuthInvalidRequestError("Поля не поддерживаются SIWC: " + ", ".join(sorted(unknown)))
+    if payload.get("stream") is not True or payload.get("store") is not False:
+        raise ChatGPTOAuthInvalidRequestError("SIWC требует stream=true и store=false")
+    if not isinstance(payload.get("input"), list):
+        raise ChatGPTOAuthInvalidRequestError("SIWC требует полную историю в массиве input")
+    for item in payload["input"]:
+        if not isinstance(item, dict):
+            raise ChatGPTOAuthInvalidRequestError("Элементы input должны быть объектами")
+        if item.get("role") == "system":
+            raise ChatGPTOAuthInvalidRequestError("Системные инструкции SIWC передаются в instructions или developer")
+        if item.get("type") not in {"message", "reasoning", "function_call", "function_call_output", "web_search_call"}:
+            raise ChatGPTOAuthInvalidRequestError("Тип элемента истории не поддерживается SIWC")
+        if item.get("type") == "function_call" and item.get("namespace") != SIWC_TOOL_NAMESPACE:
+            raise ChatGPTOAuthInvalidRequestError("Вызов функции SIWC требует namespace")
+    for tool in payload.get("tools", []):
+        if tool.get("type") == "namespace" and tool.get("name") == SIWC_TOOL_NAMESPACE:
+            if not tool.get("tools") or any(child.get("type") != "function" for child in tool["tools"]):
+                raise ChatGPTOAuthInvalidRequestError("Namespace SIWC должен содержать функции")
+        elif tool.get("type") != "web_search":
+            raise ChatGPTOAuthInvalidRequestError("Тип инструмента не поддерживается SIWC preview")
+
+
+def _tool_call_for_prepared_request(
+    item: dict[str, Any], prepared: PreparedChatRequest, *, backend: str,
+) -> ToolCall | None:
+    tool = _tool_call_from_response_item(item)
+    if tool is None or backend != "siwc":
+        return tool
+    name = tool.name
+    prefix = SIWC_TOOL_NAMESPACE + "."
+    if name.startswith(prefix):
+        name = name[len(prefix):]
+    if item.get("namespace") not in {None, SIWC_TOOL_NAMESPACE}:
+        raise ChatGPTOAuthProtocolError("Получен неизвестный namespace функции")
+    original = prepared.tool_names.get(name)
+    if original is None:
+        raise ChatGPTOAuthProtocolError("Получен вызов неизвестной функции")
+    if not tool.id or item.get("status") not in {None, "completed"}:
+        raise ChatGPTOAuthProtocolError("Получен незавершённый вызов функции")
+    try:
+        arguments = strict_json_loads(tool.arguments)
+    except ValueError as exc:
+        raise ChatGPTOAuthProtocolError("Аргументы функции не содержат полного JSON") from exc
+    if not isinstance(arguments, dict):
+        raise ChatGPTOAuthProtocolError("Аргументы функции должны быть JSON-объектом")
+    return replace(tool, name=original)
+
+
+def _siwc_response_events(stream: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Успех подтверждается завершённым событием и отсутствием ошибок в хвосте."""
+    completed: dict[str, Any] | None = None
+    output: list[dict[str, Any]] = []
+    try:
+        for event in stream:
+            _validate_response_event(event)
+            typ = event.get("type")
+            if typ in {"response.failed", "response.incomplete"}:
+                raise ChatGPTOAuthUpstreamError(502, response_failure_message(event, str(typ)))
+            if completed is not None:
+                raise ChatGPTOAuthProtocolError("После response.completed получено лишнее событие")
+            if typ == "response.completed":
+                response = _validated_completed_response(event)
+                if response.get("status") not in {None, "completed"}:
+                    raise ChatGPTOAuthProtocolError("Статус ответа не подтверждает успешное завершение")
+                completed = event
+            else:
+                if typ == "response.output_item.done":
+                    output.append(event["item"])
+                yield event
+        if completed is None:
+            raise ChatGPTOAuthProtocolError("Поток SIWC оборван до response.completed")
+        final_output = completed["response"].get("output")
+        if not isinstance(final_output, list):
+            raise ChatGPTOAuthProtocolError("response.completed: отсутствует массив output")
+        call_ids: set[str] = set()
+        for item in final_output:
+            if not isinstance(item, dict):
+                raise ChatGPTOAuthProtocolError("Элемент output должен быть объектом")
+            _validate_response_output_item(item)
+            if item.get("status") not in {None, "completed"}:
+                raise ChatGPTOAuthProtocolError("Завершённый ответ содержит незавершённый элемент")
+            if item.get("type") == "function_call":
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id or call_id in call_ids:
+                    raise ChatGPTOAuthProtocolError("Некорректный или повторный call_id функции")
+                call_ids.add(call_id)
+            if not output:
+                yield {"type": "response.output_item.done", "item": item}
+        yield completed
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
 
 
 def _validate_non_empty_string(value: object, field: str) -> str:
@@ -1890,7 +2219,9 @@ def _inspection_text_from_response_items(items: Sequence[dict[str, Any]]) -> str
     return _text_from_response_items(items).strip()
 
 
-def _decode_sse_block(lines: list[str]) -> dict[str, Any] | None:
+def _decode_sse_block(lines: list[str], *, reject_error_lines: bool = False) -> dict[str, Any] | None:
+    if reject_error_lines and any(line.startswith("error:") for line in lines):
+        raise ChatGPTOAuthUpstreamError(502, "Получена строка ошибки в потоке SIWC")
     data_lines = [line[5:].strip() for line in lines if line.startswith("data:")]
     if not data_lines:
         return None

@@ -5,10 +5,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import sys
 import time
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, distribution
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
@@ -40,7 +43,7 @@ from .auth import (
     resolve_auth_path,
     validate_auth_environment,
 )
-from .codex_config import load_codex_config
+from .codex_config import CodexConfig, load_codex_config
 from .device_login import DeviceLoginManager, LoginError
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import (
@@ -50,10 +53,12 @@ from .model_capabilities import (
 )
 from .o200k_tokenizer import count_ordinary
 from .provider import (
+    SIWC_BASE_URL,
     ChatGPTOAuthProvider,
     _usage_from_response,
     _validate_image_content_items,
     _validate_response_output_item,
+    resolve_backend,
     resolve_model_reasoning_effort,
     validate_codex_cli_version_environment,
 )
@@ -87,12 +92,14 @@ def _env_str(name: str, default: str | None) -> str | None:
 
 HOST = cast(str, _env_str("CODEX_AS_API_HOST", "127.0.0.1"))
 PORT = _env_int("CODEX_AS_API_PORT", 18080)
-validate_auth_environment()
-validate_model_capability_environment()
-validate_codex_cli_version_environment()
-CODEX_CONFIG = load_codex_config()
+BACKEND = resolve_backend()
+if BACKEND == "codex":
+    validate_auth_environment()
+    validate_model_capability_environment()
+    validate_codex_cli_version_environment()
+CODEX_CONFIG = load_codex_config() if BACKEND == "codex" else CodexConfig(codex_home="", config_path="")
 MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model)
-AUTH_PATH = _env_str("CODEX_AS_API_AUTH_PATH", None)
+AUTH_PATH = _env_str("CODEX_AS_API_SIWC_AUTH_PATH" if BACKEND == "siwc" else "CODEX_AS_API_AUTH_PATH", None)
 CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
 _CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
 _ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
@@ -205,6 +212,7 @@ def _get_provider() -> ChatGPTOAuthProvider:
         _provider = ChatGPTOAuthProvider(
             model=MODEL,
             auth_json_path=AUTH_PATH,
+            backend=BACKEND,
         )
     return _provider
 
@@ -586,8 +594,12 @@ _login_starting = False
 def _get_browser_login_manager() -> Any:
     global _browser_login_manager
     if _browser_login_manager is None:
-        from .browser_login import BrowserLoginManager
-        _browser_login_manager = BrowserLoginManager(_commit_device_login)
+        if BACKEND == "siwc":
+            from .siwc_auth import make_browser_login_manager
+            _browser_login_manager = make_browser_login_manager(AUTH_PATH)
+        else:
+            from .browser_login import BrowserLoginManager
+            _browser_login_manager = BrowserLoginManager(_commit_device_login)
     return _browser_login_manager
 
 
@@ -597,6 +609,8 @@ async def _commit_device_login(tokens: dict[str, str], guard: Any) -> bool:
 
 def _get_login_manager() -> DeviceLoginManager:
     global _login_manager
+    if BACKEND == "siwc":
+        raise LoginError("device_login_unsupported")
     if _login_manager is None:
         _login_manager = DeviceLoginManager(_commit_device_login)
     return _login_manager
@@ -644,13 +658,18 @@ async def _start_login(request: Request) -> JSONResponse:
     method = body.get("method", "browser")
     global _login_starting
     try:
-        device = _get_login_manager()
+        if BACKEND == "siwc" and method != "browser":
+            raise LoginError("device_login_unsupported")
+        device = _get_login_manager() if BACKEND == "codex" else None
         browser = _get_browser_login_manager()
-        if _login_starting or device._active is not None or browser._active is not None:
+        if _login_starting or (device is not None and device._active is not None) or browser._active is not None:
             raise LoginError("login_in_progress")
         _login_starting = True
         try:
-            record = await (browser if method == "browser" else device).start()
+            manager = browser if method == "browser" else device
+            if manager is None:
+                raise LoginError("device_login_unsupported")
+            record = await manager.start()
         finally:
             _login_starting = False
     except LoginError as exc:
@@ -659,7 +678,10 @@ async def _start_login(request: Request) -> JSONResponse:
 
 
 def _manager_for_login(login_id: str) -> tuple[Any, str]:
-    for manager, method in ((_get_login_manager(), "device"), (_get_browser_login_manager(), "browser")):
+    managers = [(_get_browser_login_manager(), "browser")]
+    if BACKEND == "codex":
+        managers.insert(0, (_get_login_manager(), "device"))
+    for manager, method in managers:
         try:
             manager.get(login_id)
             return manager, method
@@ -691,8 +713,12 @@ async def _cancel_login(login_id: str) -> JSONResponse:
 
 @app.get("/auth/status")
 async def _management_status() -> JSONResponse:
-    # This only checks the local project store, not provider-side revocation.
-    path = resolve_auth_path(AUTH_PATH)
+    # Проверяется только локальное хранилище, без обращения к провайдеру.
+    if BACKEND == "siwc":
+        from .siwc_auth import resolve_auth_path as resolve_siwc_auth_path
+        path = resolve_siwc_auth_path(AUTH_PATH)
+    else:
+        path = resolve_auth_path(AUTH_PATH)
     try:
         path.stat()
     except FileNotFoundError:
@@ -701,7 +727,9 @@ async def _management_status() -> JSONResponse:
         status = "reauthentication_required"
     else:
         try:
-            load_token_data(path)
+            token = load_token_data(path)
+            if BACKEND == "siwc" and token.oauth_profile != "siwc":
+                raise ChatGPTOAuthMissingError("Профиль OAuth не соответствует SIWC")
             status = "authenticated"
         except (ChatGPTOAuthError, OSError, ValueError):
             status = "reauthentication_required"
@@ -1706,6 +1734,36 @@ def _estimate_input_tokens(messages: list[Message], tools: list[ToolSchema] | No
 # ------------------------------------------------------------------
 
 
+def _package_revision() -> str | None:
+    """Возвращается только VCS commit установленного пакета, без локальных путей."""
+    try:
+        raw = distribution("codex-as-api").read_text("direct_url.json")
+        document = strict_json_loads(raw) if raw is not None else None
+    except (PackageNotFoundError, OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("vcs_info"), dict):
+        return None
+    vcs = document["vcs_info"]
+    commit = vcs.get("commit_id")
+    if (
+        vcs.get("vcs") != "git"
+        or not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit) is None
+    ):
+        return None
+    return commit
+
+
+def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
+    if getattr(provider, "backend", BACKEND) != "siwc":
+        return {}
+    return {
+        "backend": "siwc",
+        "upstream_base_url": SIWC_BASE_URL,
+        "package_revision": _package_revision(),
+    }
+
+
 @app.get("/health", response_model=None)
 async def health() -> JSONResponse:
     provider = _get_provider()
@@ -1715,6 +1773,7 @@ async def health() -> JSONResponse:
         return JSONResponse(
             status_code=503,
             content={
+                **_health_transport_fields(provider),
                 "status": "error",
                 "auth_available": not isinstance(
                     exc,
@@ -1756,6 +1815,7 @@ async def health() -> JSONResponse:
         return JSONResponse(
             status_code=503,
             content={
+                **_health_transport_fields(provider),
                 "status": "error",
                 "auth_available": True,
                 "catalog_status": "fresh",
@@ -1773,6 +1833,7 @@ async def health() -> JSONResponse:
         )
     return JSONResponse(
         content={
+            **_health_transport_fields(provider),
             "status": "ok",
             "auth_available": True,
             "catalog_status": "fresh",
@@ -1834,6 +1895,7 @@ async def list_models() -> JSONResponse:
                     "default_verbosity": model.default_verbosity,
                 }
                 for model in snapshot.models
+                if snapshot.backend != "siwc" or (model.visibility == "list" and model.supported_in_api)
             ],
         }
     )
@@ -2234,6 +2296,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 
 @app.post("/v1/images/generations")
 async def images_generations(request: ImageGenerationRequest) -> JSONResponse:
+    if BACKEND == "siwc":
+        raise ChatGPTOAuthInvalidRequestError("Генерация изображений не поддерживается подписочным SIWC preview")
     provider = _get_provider()
     _reject_explicit_null_fields(request, ("user", "multi_agent", "programmatic_tool_calling"))
     if "responses_lite" in request.model_fields_set and request.responses_lite is None:
@@ -2704,6 +2768,8 @@ async def compact(request: Request) -> JSONResponse:
     Also accepts Anthropic Messages fields at /v1/messages/compact.
     """
     provider = _get_provider()
+    if getattr(provider, "backend", BACKEND) == "siwc":
+        raise ChatGPTOAuthInvalidRequestError("/responses/compact не подтверждён для SIWC OAuth и отключён")
     body = await _request_json_object(request)
     _reject_explicit_null_responses_lite(body)
     is_anthropic_compact = request.url.path == "/v1/messages/compact"
@@ -2822,7 +2888,13 @@ async def compact(request: Request) -> JSONResponse:
 # ------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int | None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if BACKEND == "siwc" and args:
+        from .siwc_cli import main as siwc_main
+        return siwc_main(args)
+
     import uvicorn
 
     uvicorn.run("codex_as_api.server:app", host=HOST, port=PORT, log_level="info")
+    return None

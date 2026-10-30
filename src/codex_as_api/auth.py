@@ -160,6 +160,9 @@ class ChatGPTTokenData:
     fedramp: bool
     access_expires_at: _dt.datetime | None
     login_generation: str | None = None
+    oauth_profile: str = "codex"
+    client_id: str | None = None
+    resource: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -273,6 +276,13 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
 def _token_data_from_document(data: object, path: pathlib.Path) -> ChatGPTTokenData:
     if not isinstance(data, dict):
         raise ChatGPTOAuthMissingError("ChatGPT OAuth auth file root must be an object")
+    profile = data.get("oauth_profile", "codex")
+    if profile == "siwc":
+        from .siwc_auth import token_data_from_document
+
+        return token_data_from_document(data, path)
+    if profile != "codex":
+        raise ChatGPTOAuthMissingError("Unsupported OAuth credential profile")
     generation = data.get("_login_generation")
     if generation is not None and (not isinstance(generation, str) or not generation):
         raise ChatGPTOAuthMissingError("ChatGPT OAuth login generation is invalid")
@@ -481,15 +491,26 @@ def _write_auth_json(
         raise failure
 
 
-def token_for_request(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTokenData:
+def token_for_request(
+    auth_json_path: str | pathlib.Path | None = None, *, expected_profile: str | None = None
+) -> ChatGPTTokenData:
     current = load_token_data(auth_json_path)
+    _require_profile(current, expected_profile)
     if not current.expires_within():
         return current
     return _refresh_token(current, refresh_if_expiring=True)
 
 
-def refresh_after_unauthorized(current: ChatGPTTokenData) -> ChatGPTTokenData:
+def refresh_after_unauthorized(
+    current: ChatGPTTokenData, *, expected_profile: str | None = None
+) -> ChatGPTTokenData:
+    _require_profile(current, expected_profile)
     return _refresh_token(current, refresh_if_expiring=False)
+
+
+def _require_profile(current: ChatGPTTokenData, expected_profile: str | None) -> None:
+    if expected_profile is not None and current.oauth_profile != expected_profile:
+        raise ChatGPTOAuthMissingError("OAuth credential profile does not match the selected backend")
 
 
 def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTokenData:
@@ -497,6 +518,10 @@ def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTo
 
 
 def _fail_if_account_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> None:
+    if (current.oauth_profile, current.client_id, current.resource) != (
+        latest.oauth_profile, latest.client_id, latest.resource
+    ):
+        raise ChatGPTOAuthRefreshError("OAuth registration changed while refreshing credentials")
     if current.account_id != latest.account_id:
         raise ChatGPTOAuthRefreshError("ChatGPT OAuth account changed while refreshing credentials")
     if current.login_generation != latest.login_generation:
@@ -555,6 +580,10 @@ def validate_auth_environment() -> None:
 
 
 def _refresh_token(current: ChatGPTTokenData, *, refresh_if_expiring: bool) -> ChatGPTTokenData:
+    if current.oauth_profile == "siwc":
+        from .siwc_auth import refresh_credentials
+
+        return refresh_credentials(current, refresh_if_expiring=refresh_if_expiring)
     lock = _refresh_lock(current.auth_path)
     with lock:
         latest = load_token_data(current.auth_path)

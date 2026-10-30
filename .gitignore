@@ -12,3 +12,9 @@ uv.lock
 ts/node_modules/
 ts/dist/
 .pnpm-store/
+/auth.json
+/credentials.json
+/.env
+/.env.*
+/*.log
+/*.pid

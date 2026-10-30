@@ -1,5 +1,9 @@
 # codex-as-api
 
+> Ветка `siwc-oauth`: дополнительный Python-профиль официального подписочного
+> OAuth → public Responses API. Инструкция, ограничения preview и отдельная
+> авторизация описаны в [SIWC.md](SIWC.md). Режим upstream по умолчанию сохранён.
+
 [![GitHub Release](https://img.shields.io/github/v/release/Eunho-J/codex-as-api)](https://github.com/Eunho-J/codex-as-api/releases)
 [![PyPI](https://img.shields.io/pypi/v/codex-as-api)](https://pypi.org/project/codex-as-api/)
 [![npm](https://img.shields.io/npm/v/codex-as-api)](https://www.npmjs.com/package/codex-as-api)

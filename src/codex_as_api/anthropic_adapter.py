@@ -70,7 +70,14 @@ def anthropic_request_to_internal(
         _reject_unknown_fields(msg, {"role", "content"}, f"messages[{index}]")
         role = msg.get("role")
         content = msg.get("content")
-        if role == "user":
+        if role == "system":
+            # Служебные сообщения окружения переносятся в инструкции, не в input.system.
+            if not isinstance(content, (str, list)):
+                raise ValueError("Системное сообщение должно содержать строку или массив текста")
+            sys_text = _extract_system_text(content)
+            if sys_text:
+                internal_messages.append(Message(role=MessageRole.SYSTEM, content=sys_text))
+        elif role == "user":
             _convert_user_message(content, internal_messages)
         elif role == "assistant":
             _convert_assistant_message(content, internal_messages, backend_model=backend_model)

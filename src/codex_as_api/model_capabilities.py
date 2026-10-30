@@ -108,6 +108,7 @@ class ModelCatalogSnapshot:
     etag: str | None
     fetched_at: float
     expires_at: float
+    backend: str = "codex"
 
     @property
     def account_id(self) -> str:
@@ -123,7 +124,10 @@ class ModelCatalogSnapshot:
 
     def model(self, slug: str) -> ModelCapability:
         try:
-            return self.models_by_slug[slug]
+            model = self.models_by_slug[slug]
+            if self.backend == "siwc" and not model.supported_in_api:
+                raise ChatGPTOAuthModelNotFoundError("Модель недоступна в публичном каталоге учётной записи")
+            return model
         except KeyError as exc:
             raise ChatGPTOAuthModelNotFoundError("requested model was not found in the authenticated catalog") from exc
 
@@ -131,12 +135,19 @@ class ModelCatalogSnapshot:
         visible = [
             model
             for model in self.models
-            if model.visibility == "list" and model.slug not in _VERIFIED_HIDDEN_MODEL_SLUGS
+            if model.visibility == "list"
+            and (
+                model.supported_in_api
+                if self.backend == "siwc"
+                else model.slug not in _VERIFIED_HIDDEN_MODEL_SLUGS
+            )
         ]
         if not visible:
             raise ChatGPTOAuthCatalogUnavailableError(
                 "upstream model catalog has no model with list visibility for default selection"
             )
+        if self.backend == "siwc":
+            return visible[0]
         return min(enumerate(visible), key=lambda item: (item[1].priority, item[0]))[1]
 
 
@@ -163,6 +174,7 @@ class ModelCatalogCache:
         loader: Callable[[], CatalogLoadResult],
         *,
         ttl_seconds: float,
+        backend: str = "codex",
     ) -> ModelCatalogSnapshot:
         if (
             not isinstance(ttl_seconds, (int, float))
@@ -199,6 +211,7 @@ class ModelCatalogCache:
                 etag=loaded.etag,
                 fetched_at=now,
                 expires_at=now + ttl_seconds,
+                backend=backend,
             )
         except Exception as exc:
             with self._condition:
@@ -259,6 +272,7 @@ def parse_model_catalog(
     etag: str | None,
     fetched_at: float,
     expires_at: float,
+    backend: str = "codex",
 ) -> ModelCatalogSnapshot:
     if not isinstance(document, dict):
         raise ChatGPTOAuthCatalogUnavailableError("model catalog response must be a JSON object")
@@ -269,14 +283,15 @@ def parse_model_catalog(
     models: list[ModelCapability] = []
     by_slug: dict[str, ModelCapability] = {}
     for index, value in enumerate(raw_models):
-        model = _model_from_mapping(value, index=index)
+        normalized = _siwc_model_mapping(value, index=index) if backend == "siwc" else value
+        model = _model_from_mapping(normalized, index=index)
         if model.slug in by_slug:
             raise ChatGPTOAuthCatalogUnavailableError("model catalog contains a duplicate model slug")
-        if model.slug in _VERIFIED_HIDDEN_MODEL_SLUGS:
+        if backend != "siwc" and model.slug in _VERIFIED_HIDDEN_MODEL_SLUGS:
             model = _promote_verified_hidden_model(model)
         by_slug[model.slug] = model
         models.append(model)
-    for fallback in _VERIFIED_HIDDEN_MODELS:
+    for fallback in (() if backend == "siwc" else _VERIFIED_HIDDEN_MODELS):
         if fallback.slug not in by_slug:
             by_slug[fallback.slug] = fallback
             models.append(fallback)
@@ -287,7 +302,34 @@ def parse_model_catalog(
         etag=etag.strip() if isinstance(etag, str) and etag.strip() else None,
         fetched_at=fetched_at,
         expires_at=expires_at,
+        backend=backend,
     )
+
+
+def _siwc_model_mapping(value: object, *, index: int) -> dict[str, Any]:
+    """Нормализуются только опубликованные возможности, без скрытых моделей."""
+    where = f"models[{index}]"
+    if not isinstance(value, dict):
+        raise ChatGPTOAuthCatalogUnavailableError(f"{where}: ожидается объект")
+    slug = _required_string(value, "slug", where)
+    if slug != slug.strip():
+        raise ChatGPTOAuthCatalogUnavailableError(f"{where}.slug: недопустимы окружающие пробелы")
+    _required_string(value, "display_name", where)
+    _required_string(value, "visibility", where)
+    normalized: dict[str, Any] = {
+        "priority": index,
+        "supported_in_api": True,
+        "supported_reasoning_levels": [],
+        "input_modalities": ["text"],
+        "support_verbosity": False,
+        **value,
+    }
+    reasoning_available = bool(normalized["supported_reasoning_levels"])
+    normalized.setdefault("supports_reasoning_summary_parameter", reasoning_available)
+    normalized.setdefault("default_reasoning_summary", "auto" if reasoning_available else "none")
+    # Внутренний Responses Lite не относится к публичному протоколу.
+    normalized["use_responses_lite"] = False
+    return normalized
 
 
 def resolve_model(
