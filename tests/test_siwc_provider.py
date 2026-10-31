@@ -280,6 +280,17 @@ def test_siwc_done_tool_without_completed_is_not_yielded(siwc_provider):
     assert not any(event["type"] == "tool_call" for event in events)
 
 
+def test_siwc_empty_completed_output_keeps_streamed_items(siwc_provider):
+    item = {"type": "function_call", "name": "read", "namespace": SIWC_TOOL_NAMESPACE,
+            "arguments": "{}", "call_id": "call_synthetic", "status": "completed"}
+    provider, _ = siwc_provider(events=[{"type": "response.output_item.done", "item": item}, _completed([])])
+    events = list(provider.chat_stream(
+        _messages(), tools=[ToolSchema(name="read", description="Чтение", parameters={})],
+    ))
+    assert [event["id"] for event in events if event["type"] == "tool_call"] == ["call_synthetic"]
+    assert events[-1]["type"] == "finish"
+
+
 def test_siwc_namespace_function_and_encrypted_reasoning_roundtrip(siwc_provider):
     original_name = "synthetic.read-file"
     wire_name = provider_module._siwc_wire_name(original_name)

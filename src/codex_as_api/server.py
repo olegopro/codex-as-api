@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import sys
@@ -236,6 +237,7 @@ def _error_status(exc: BaseException) -> int:
 
 
 def _public_error_message(exc: BaseException) -> str:
+    logging.getLogger("uvicorn.error").warning("%s: %s", type(exc).__name__, exc, exc_info=exc)
     if isinstance(exc, (ChatGPTOAuthMissingError, ChatGPTOAuthRefreshError)):
         return "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
     if isinstance(exc, (ChatGPTOAuthInvalidRequestError, ChatGPTOAuthModelNotFoundError)):

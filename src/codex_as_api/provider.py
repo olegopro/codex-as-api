@@ -1180,9 +1180,12 @@ class ChatGPTOAuthProvider:
                         if not isinstance(item, dict):
                             raise ChatGPTOAuthProtocolError("response.completed.output: ожидаются объекты")
                         _validate_response_output_item(item)
-                    if final_output and final_output != completed_output:
-                        raise ChatGPTOAuthProtocolError("Завершённый output не совпадает с элементами потока")
-                    final_output = deepcopy(completed_output)
+                    # Живой public Responses при stream:true отдаёт в completed пустой output:
+                    # элементы уже пришли в output_item.done, сверять тогда нечего.
+                    if completed_output:
+                        if final_output and final_output != completed_output:
+                            raise ChatGPTOAuthProtocolError("Завершённый output не совпадает с элементами потока")
+                        final_output = deepcopy(completed_output)
                 display_output = deepcopy(final_output)
                 for item in display_output:
                     tool = _tool_call_for_prepared_request(item, prepared, backend=self.backend)
