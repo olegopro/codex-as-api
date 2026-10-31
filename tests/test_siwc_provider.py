@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import httpx
@@ -22,6 +25,44 @@ from codex_as_api.messages import Message, MessageRole, ToolSchema
 from codex_as_api.model_capabilities import parse_model_catalog
 from codex_as_api.provider import SIWC_BASE_URL, SIWC_TOOL_NAMESPACE, ChatGPTOAuthProvider
 from codex_as_api.reasoning_signature import encode_reasoning_signature
+
+
+def test_siwc_uses_configured_https_proxy_without_a_direct_connection(monkeypatch):
+    targets = []
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_CONNECT(self):
+            targets.append(self.path)
+            self.send_error(502, "synthetic proxy refusal")
+
+        def log_message(self, *_args):
+            pass
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{proxy.server_port}"
+    for key in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.setenv(key, url)
+    for key in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(provider_module, "token_for_request", lambda *_args, **_kwargs: _token())
+    original = socket.getaddrinfo
+
+    def loopback_only(host, *args, **kwargs):
+        assert host == "127.0.0.1", "a direct connection bypassed the required proxy"
+        return original(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", loopback_only)
+    try:
+        provider = ChatGPTOAuthProvider(backend="siwc", catalog_timeout=1)
+        with pytest.raises(ChatGPTOAuthCatalogUnavailableError):
+            provider.get_model_catalog()
+        assert targets == ["api.openai.com:443"]
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=2)
 
 
 def _catalog() -> dict:
@@ -110,7 +151,7 @@ def siwc_provider(monkeypatch):
             auth=("synthetic-unused-user", "synthetic-unused-password"),
         )
         clients.append(client)
-        provider = ChatGPTOAuthProvider(backend="siwc", http_client=client, model=model)
+        provider = ChatGPTOAuthProvider(backend="siwc", http_client=client, model=model, siwc_transport="http")
         return provider, requests
 
     yield factory

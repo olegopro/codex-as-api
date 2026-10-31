@@ -32,6 +32,7 @@ dependencies = [
     "regex",
     "tomli>=2; python_version < '3.11'",
     "uvicorn>=0.23",
+    "websockets>=17.2,<18",
 ]
 
 [project.optional-dependencies]

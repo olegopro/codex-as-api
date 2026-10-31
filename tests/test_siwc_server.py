@@ -1,19 +1,70 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from codex_as_api import server
-from codex_as_api.auth import ChatGPTOAuthMissingError
+from codex_as_api.auth import ChatGPTOAuthMissingError, ChatGPTOAuthProtocolError
 from codex_as_api.codex_config import CodexConfig
 from codex_as_api.provider import SIWC_BASE_URL
 
 from . import test_siwc_provider
 
 siwc_provider = test_siwc_provider.siwc_provider
+
+
+def test_session_metadata_keeps_channel_affinity_without_a_header():
+    body = {"metadata": {"user_id": json.dumps({"session_id": "session-a"})}}
+    assert server._anthropic_prompt_cache_key(body, None) == server._anthropic_prompt_cache_key({}, "session-a")
+    expected = server._anthropic_prompt_cache_key({}, "header-wins")
+    assert server._anthropic_prompt_cache_key(body, "header-wins") == expected
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_siwc_heartbeat_keeps_one_upstream_stream_and_preserves_completion(siwc_client, monkeypatch, fail):
+    client, provider, _ = siwc_client
+    original = provider.chat_stream
+    calls = 0
+
+    def delayed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.08)
+        if fail:
+            raise ChatGPTOAuthProtocolError("synthetic interrupted stream")
+        yield from original(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "chat_stream", delayed)
+    monkeypatch.setattr(server, "ANTHROPIC_HEARTBEAT_SECONDS", 0.01)
+    response = client.post("/v1/messages", json=_body(stream=True))
+    assert response.status_code == 200
+    assert calls == 1
+    assert 'event: ping\ndata: {"type":"ping"}\n\n' in response.text
+    if fail:
+        assert "event: error" in response.text
+        assert "event: message_stop" not in response.text
+    else:
+        assert "event: message_stop" in response.text
+        assert "event: error" not in response.text
+    assert response.text.index("event: ping") < response.text.index("event: error" if fail else "event: message_stop")
+
+
+def test_siwc_server_upstream_timeout_exceeds_the_client_idle_watchdog(monkeypatch):
+    monkeypatch.setattr(server, "_provider", None)
+    monkeypatch.setattr(server, "BACKEND", "siwc")
+    arguments = {}
+
+    def create(**kwargs):
+        arguments.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(server, "ChatGPTOAuthProvider", create)
+    server._get_provider()
+    assert arguments["timeout"] == 600.0
 
 
 @pytest.fixture()

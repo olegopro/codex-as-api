@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, cast
 
 from .auth import ChatGPTOAuthProtocolError
@@ -759,6 +760,7 @@ def internal_response_to_anthropic(
     thinking_display: str = "summarized",
     backend_model: str | None = None,
     thinking_disabled: bool = False,
+    stop_sequences: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if thinking_display not in {"summarized", "omitted"}:
         raise ValueError("thinking_display must be 'summarized' or 'omitted'")
@@ -766,6 +768,15 @@ def internal_response_to_anthropic(
         not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
     ):
         raise ValueError("backend_model must be a non-empty string when provided")
+    stop_sequence = None
+    if stop_sequences:
+        stop_buffer = _StopBuffer(stop_sequences)
+        text = stop_buffer.feed(response.content, final=True)
+        stop_sequence = stop_buffer.matched
+        if stop_sequence is not None:
+            if response.tool_calls:
+                raise ChatGPTOAuthProtocolError("tool calls conflict with a matched stop sequence")
+            response = replace(response, content=text, finish_reason="stop")
     content: list[dict[str, Any]] = []
 
     _reject_unrepresentable_response_events(response.raw)
@@ -841,8 +852,8 @@ def internal_response_to_anthropic(
         "container": None,
         "content": content,
         "context_management": None,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_reason": "stop_sequence" if stop_sequence is not None else stop_reason,
+        "stop_sequence": stop_sequence,
         "usage": usage_dict,
     }
     effective_reasoning = response.reasoning_content or "".join(visible_reasoning_parts)
@@ -954,6 +965,58 @@ def _map_stop_reason(finish_reason: str | None, has_tool_calls: bool) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _StopBuffer:
+    def __init__(self, sequences: Sequence[str]) -> None:
+        if any(not isinstance(value, str) or not value for value in sequences):
+            raise ValueError("stop_sequences must contain non-empty strings")
+        self.sequences = tuple(sequences)
+        self.keep = max(map(len, sequences)) - 1
+        self.pending = ""
+        self.matched: str | None = None
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        if self.matched is not None:
+            return ""
+        self.pending += text
+        matches = [(self.pending.find(value), index, value) for index, value in enumerate(self.sequences)]
+        first = min((match for match in matches if match[0] >= 0), default=None)
+        if first is not None:
+            at, _, self.matched = first
+            text, self.pending = self.pending[:at], ""
+            return text
+        at = len(self.pending) if final else max(0, len(self.pending) - self.keep)
+        text, self.pending = self.pending[:at], self.pending[at:]
+        return text
+
+
+def _stop_sequence_events(events: Iterator[dict[str, Any]], sequences: Sequence[str]) -> Iterator[dict[str, Any]]:
+    """Trim visible text, but read completion to preserve authoritative usage and errors."""
+    stop = _StopBuffer(sequences)
+    try:
+        for event in events:
+            if isinstance(event, dict) and event.get("type") == "content":
+                text = event.get("text")
+                if not isinstance(text, str):
+                    raise ChatGPTOAuthProtocolError("provider content event requires string text")
+                visible = stop.feed(text)
+                if visible:
+                    yield {**event, "text": visible}
+                continue
+            tail = stop.feed("", final=True)
+            if tail:
+                yield {"type": "content", "text": tail}
+            if isinstance(event, dict) and stop.matched is not None:
+                if event.get("type") == "tool_call":
+                    raise ChatGPTOAuthProtocolError("tool calls conflict with a matched stop sequence")
+                if event.get("type") == "finish":
+                    event = {**event, "finish_reason": "stop", "_anthropic_stop_sequence": stop.matched}
+            yield event
+    finally:
+        close = getattr(events, "close", None)
+        if close is not None:
+            close()
+
+
 def anthropic_stream_adapter(
     event_stream: Iterator[dict[str, Any]],
     model: str,
@@ -962,6 +1025,7 @@ def anthropic_stream_adapter(
     thinking_display: str = "summarized",
     backend_model: str | None = None,
     thinking_disabled: bool = False,
+    stop_sequences: Sequence[str] | None = None,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
     if thinking_display not in {"summarized", "omitted"}:
@@ -971,12 +1035,20 @@ def anthropic_stream_adapter(
     ):
         raise ValueError("backend_model must be a non-empty string when provided")
     yield _message_start_sse(model, request_id)
-    yield from _render_anthropic_stream_events(
-        event_stream,
-        thinking_display=thinking_display,
-        default_signature_model=backend_model or model,
-        thinking_disabled=thinking_disabled,
-    )
+    if stop_sequences:
+        event_stream = _stop_sequence_events(event_stream, stop_sequences)
+    try:
+        yield from _render_anthropic_stream_events(
+            event_stream,
+            thinking_display=thinking_display,
+            default_signature_model=backend_model or model,
+            thinking_disabled=thinking_disabled,
+        )
+    finally:
+        if stop_sequences:
+            close = getattr(event_stream, "close", None)
+            if close is not None:
+                close()
 
 
 def _message_start_sse(model: str, request_id: str) -> str:
@@ -1476,6 +1548,9 @@ def _render_anthropic_stream_events(
                 "delta": {"container": None, "stop_reason": stop_reason, "stop_sequence": None},
                 "usage": usage,
             }
+            stop_sequence = event.get("_anthropic_stop_sequence")
+            if stop_sequence is not None:
+                message_delta["delta"].update(stop_reason="stop_sequence", stop_sequence=stop_sequence)
             yield _sse("message_delta", message_delta)
             yield _sse("message_stop", {"type": "message_stop"})
             return

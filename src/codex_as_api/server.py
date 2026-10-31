@@ -10,16 +10,17 @@ import re
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distribution
 from typing import Any, cast
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
-from starlette.concurrency import run_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.datastructures import Headers
 
 from .anthropic_adapter import (
@@ -102,6 +103,7 @@ CODEX_CONFIG = load_codex_config() if BACKEND == "codex" else CodexConfig(codex_
 MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model)
 AUTH_PATH = _env_str("CODEX_AS_API_SIWC_AUTH_PATH" if BACKEND == "siwc" else "CODEX_AS_API_AUTH_PATH", None)
 CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
+ANTHROPIC_HEARTBEAT_SECONDS = 10.0
 _CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
 _ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
 _ANTHROPIC_MESSAGES_FIELDS = frozenset(
@@ -214,8 +216,52 @@ def _get_provider() -> ChatGPTOAuthProvider:
             model=MODEL,
             auth_json_path=AUTH_PATH,
             backend=BACKEND,
+            timeout=600.0 if BACKEND == "siwc" else None,
         )
     return _provider
+
+
+async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> AsyncIterator[str]:
+    """Keep the client alive without timing out or restarting the upstream iterator."""
+    send, receive = anyio.create_memory_object_stream[str](1)
+
+    async def pump() -> None:
+        try:
+            async with send:
+                async for chunk in iterate_in_threadpool(chunks):
+                    await send.send(chunk)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            return
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(pump)
+        finished = False
+        try:
+            async with receive:
+                while True:
+                    with anyio.move_on_after(ANTHROPIC_HEARTBEAT_SECONDS) as idle:
+                        try:
+                            chunk = await receive.receive()
+                        except anyio.EndOfStream:
+                            finished = True
+                            return
+                    if idle.cancel_called:
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                    else:
+                        yield chunk
+        except GeneratorExit:
+            return
+        finally:
+            try:
+                if not finished and cancel is not None:
+                    with anyio.CancelScope(shield=True):
+                        await run_in_threadpool(cancel.cancel)
+            finally:
+                tasks.cancel_scope.cancel()
 
 
 def _error_status(exc: BaseException) -> int:
@@ -419,6 +465,17 @@ def _anthropic_prompt_cache_key(body: dict[str, Any], claude_session_id: str | N
             raise ChatGPTOAuthInvalidRequestError("prompt_cache_key must be a non-empty string")
         return explicit
     if claude_session_id is None:
+        metadata = body.get("metadata")
+        user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+        if isinstance(user_id, str):
+            try:
+                identity = strict_json_loads(user_id)
+            except ValueError:
+                identity = None
+            session = identity.get("session_id") if isinstance(identity, dict) else None
+            if isinstance(session, str) and session.strip():
+                claude_session_id = session
+    if claude_session_id is None:
         return None
     value = f"{_CLAUDE_CACHE_KEY_NAMESPACE}{claude_session_id}".encode()
     return hashlib.sha256(value).hexdigest()
@@ -620,13 +677,16 @@ def _get_login_manager() -> DeviceLoginManager:
 
 @app.on_event("shutdown")
 async def _close_login_manager() -> None:
-    global _login_manager, _browser_login_manager, _login_starting
+    global _login_manager, _browser_login_manager, _login_starting, _provider
     if _login_manager is not None:
         await _login_manager.close()
         _login_manager = None
     if _browser_login_manager is not None:
         await _browser_login_manager.close()
         _browser_login_manager = None
+    if _provider is not None and getattr(_provider, "_siwc_websockets", None) is not None:
+        await run_in_threadpool(_provider.close)
+        _provider = None
     _login_starting = False
 
 
@@ -1762,6 +1822,7 @@ def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
     return {
         "backend": "siwc",
         "upstream_base_url": SIWC_BASE_URL,
+        "upstream_transport": provider.siwc_transport,
         "package_revision": _package_revision(),
     }
 
@@ -2509,6 +2570,9 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     except (ValueError, ChatGPTOAuthInvalidRequestError) as exc:
         return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
 
+    local_stop_sequences = stop if getattr(provider, "backend", BACKEND) == "siwc" else None
+    if getattr(provider, "backend", BACKEND) == "siwc":
+        stop = None
     stream = body.get("stream", False)
     if not isinstance(stream, bool):
         return JSONResponse(
@@ -2631,6 +2695,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                     thinking_display=thinking_display,
                     backend_model=request_model,
                     thinking_disabled=suppress_thinking_output,
+                    stop_sequences=local_stop_sequences,
                 )
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
@@ -2639,7 +2704,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
 
         try:
             return StreamingResponse(
-                _stream(),
+                _anthropic_heartbeat(_stream(), cancel=getattr(prepared_request, "cancel", None)),
                 media_type="text/event-stream",
             )
         except ChatGPTOAuthError as exc:
@@ -2689,6 +2754,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             thinking_display=thinking_display,
             backend_model=request_model,
             thinking_disabled=suppress_thinking_output,
+            stop_sequences=local_stop_sequences,
         )
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)
@@ -2898,5 +2964,12 @@ def main(argv: list[str] | None = None) -> int | None:
 
     import uvicorn
 
+    logger = logging.getLogger("codex_as_api")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
     uvicorn.run("codex_as_api.server:app", host=HOST, port=PORT, log_level="info")
     return None

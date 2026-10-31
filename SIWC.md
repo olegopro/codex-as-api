@@ -64,13 +64,32 @@ GET каталога; при необходимости обновляет grant
 ## Протокол
 
 - Каталог аккаунта: Bearer GET `https://api.openai.com/v1/models`.
-- Генерация: POST `/v1/responses`, `store:false`, `stream:true`, полный `input`.
+- Генерация по умолчанию: `wss://api.openai.com/v1/responses`, событие
+  `response.create`, `store:false`, полный `input` на каждом ходу. Сокет сохраняется
+  отдельно для аккаунта, сессии (`prompt_cache_key`) и модели. Канал другой модели
+  не вытесняет основной. История по `previous_response_id` в шлюзе не хранится.
+- Прямой контроль 2026-10-31: повтор на том же WebSocket прочитал 1792 из 1926
+  токенов; переподключение дало 0 из 1929. HTTP-контроль дал 0. Эти результаты
+  относятся к текущему grant и Sol, а не обещают одинаковую экономию каждому плану.
+- До 16 каналов; неактивные вытесняются при следующем обращении по LRU/30 минутам
+  простоя. Канал обновляется при смене токена и перед часовым пределом соединения.
+  Отдельного уборщика или дополнительного сервиса нет.
+- `CODEX_AS_API_SIWC_TRANSPORT=http` — явный диагностический HTTP/SSE; автоматического
+  отката на него, legacy или API key нет. Каталог и OAuth остаются HTTP-запросами.
+- Явный HTTPS proxy учитывается каталогом и WebSocket. Соединение не перенаправляется
+  на ChatGPT `backend-api`; credentials по-прежнему только из SIWC-профиля.
 - Инструкции передаются как `instructions`/developer, не system-role input items.
 - Function/custom tools приводятся к разрешённому preview формату; namespace содержит
   обязательный непустой `description`. Вызовы и результаты сохраняют имена и call IDs
   на стороне Anthropic-клиента.
 - Успех требует `response.completed`: EOF, failed/incomplete и потоковая ошибка не
   означают успешного завершения и не завершают недописанный tool-call.
+- Anthropic SSE отправляет `ping` каждые 10 секунд тишины. Отмена незавершённого
+  запроса закрывает его канал, не затрагивая соседние. Таймаут SIWC upstream — 600 с.
+- `stop_sequences` Anthropic-фасада обрабатываются локально, включая маркер
+  `</block>` внутренних вызовов Claude Code. Клиент получает обрезанный текст,
+  `stop_reason: stop_sequence` и сам маркер. Upstream дочитывается до завершения:
+  usage учитывает весь фактически созданный вывод, ошибки после маркера не скрываются.
 - Запрещённые preview-параметры не отправляются, включая `max_output_tokens`,
   `metadata`, `temperature` и HTTP `previous_response_id`.
 - Потолок Anthropic `max_tokens` нельзя объявлять гарантированным upstream cap:
@@ -98,5 +117,6 @@ configurable context и effective input budget не взаимозаменяем
 - [Официальный sign-in contract](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
 - [Каталог и inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 - [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+- [Responses WebSocket](https://developers.openai.com/api/docs/guides/websocket-mode)
 - [Аккаунты, refresh и хранение](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
 - [OIDC discovery](https://auth.openai.com/.well-known/openid-configuration)

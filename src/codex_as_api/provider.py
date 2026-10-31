@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -255,6 +255,37 @@ class _ResponseChainStore:
                 self._chains.popitem(last=False)
 
 
+class _RequestCancellation:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._callback: Callable[[], None] | None = None
+
+    def check(self) -> None:
+        with self._lock:
+            if self._cancelled:
+                raise OSError("SIWC request was cancelled by the client")
+
+    @contextmanager
+    def bind(self, callback: Callable[[], None]) -> Iterator[None]:
+        with self._lock:
+            if self._cancelled:
+                raise OSError("SIWC request was cancelled by the client")
+            self._callback = callback
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._callback = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            callback, self._callback = self._callback, None
+        if callback is not None:
+            callback()
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedChatRequest:
     payload: dict[str, Any]
@@ -262,12 +293,14 @@ class PreparedChatRequest:
     snapshot: ModelCatalogSnapshot
     capability: ModelCapability
     tool_names: dict[str, str] = field(default_factory=dict)
+    cancel: _RequestCancellation = field(default_factory=_RequestCancellation, compare=False, repr=False)
 
 
 class _TransportHeaders(dict[str, str]):
     def __init__(self, *args: Any, catalog_key: CatalogKey | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.catalog_key = catalog_key
+        self.cancel: _RequestCancellation | None = None
 
 
 def validate_codex_cli_version_environment() -> None:
@@ -498,8 +531,16 @@ class ChatGPTOAuthProvider:
         catalog_timeout: float | None = None,
         catalog_ttl: float | None = None,
         version_resolver: CodexVersionResolver | CodexVersionProvider | None = None,
+        siwc_transport: str | None = None,
     ) -> None:
         self.backend = resolve_backend(backend)
+        self.siwc_transport = siwc_transport or os.getenv("CODEX_AS_API_SIWC_TRANSPORT", "websocket")
+        if self.backend == "siwc" and self.siwc_transport not in {"http", "websocket"}:
+            raise ValueError("SIWC transport must be http or websocket")
+        self._siwc_websockets: Any = None
+        if self.backend == "siwc" and self.siwc_transport == "websocket":
+            from .siwc_transport import SIWCWebSocketPool
+            self._siwc_websockets = SIWCWebSocketPool()
         if self.backend == "codex":
             validate_codex_cli_version_environment()
             validate_auth_environment()
@@ -591,7 +632,8 @@ class ChatGPTOAuthProvider:
         content = request.data
         if content is not None and not isinstance(content, bytes):
             raise ChatGPTOAuthInvalidRequestError("Тело публичного запроса должно содержать байты JSON")
-        client = self._http_client or httpx.Client(trust_env=False)
+        # Honor the configured HTTPS proxy just as OAuth refresh and legacy do.
+        client = self._http_client or httpx.Client(trust_env=True)
         response = None
         try:
             public_request = httpx.Request(
@@ -630,6 +672,11 @@ class ChatGPTOAuthProvider:
             raise RuntimeError(
                 f"failed to close {len(failures)} active response(s); first failure: {failures[0]}"
             ) from failures[0]
+
+    def close(self) -> None:
+        if self._siwc_websockets is not None:
+            self._siwc_websockets.close()
+        self.cancel_current_requests()
 
     def get_model_catalog(self) -> ModelCatalogSnapshot:
         token = self._token_for_request()
@@ -964,6 +1011,7 @@ class ChatGPTOAuthProvider:
             payload,
             catalog_key=prepared.snapshot.key,
         )
+        extra_headers.cancel = prepared.cancel
         if subagent is not None:
             extra_headers["x-openai-subagent"] = _validate_header_token(subagent, "subagent")
         if memgen_request is not None:
@@ -1746,6 +1794,35 @@ class ChatGPTOAuthProvider:
         extra_headers: dict[str, str] | None = None,
         catalog_key: CatalogKey | None = None,
     ) -> Iterator[dict[str, Any]]:
+        if self.backend == "siwc" and self.siwc_transport == "websocket":
+            if path != "/responses":
+                raise ChatGPTOAuthInvalidRequestError("SIWC WebSocket supports only /responses")
+            _validate_siwc_wire_payload(payload)
+            for attempt in range(2):
+                token = self._token_for_request()
+                _require_catalog_account(token.account_id, catalog_key)
+                ws_token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
+                try:
+                    for event in self._siwc_websockets.events(
+                        payload, account_id=token.account_id, access_token=token.access_token, timeout=self.timeout,
+                        cancel=getattr(extra_headers, "cancel", None),
+                    ):
+                        if event.get("type") in {"error", "response.failed", "response.incomplete"}:
+                            event = _redact_failure_event(event, ws_token_values)
+                        yield event
+                    return
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 401 and attempt == 0:
+                        exc.close()
+                        self._refresh_after_unauthorized(token)
+                        continue
+                    redacted = _http_error_body(exc, ws_token_values, deadline=time.monotonic() + self.timeout)
+                    raise ChatGPTOAuthUpstreamError(exc.code, f"SIWC WebSocket handshake failed: {redacted}") from exc
+                except OSError as exc:
+                    raise ChatGPTOAuthUpstreamError(
+                        502, f"SIWC WebSocket transport failed: {redact_text(str(exc), *ws_token_values)}",
+                    ) from exc
+            return
         token_values: tuple[str | None, ...] = (None,)
         resolved_client_version = (
             catalog_key[2] if catalog_key is not None else self._resolve_client_version()
