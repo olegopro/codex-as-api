@@ -11,6 +11,7 @@ from codex_as_api import server
 from codex_as_api.auth import ChatGPTOAuthMissingError, ChatGPTOAuthProtocolError
 from codex_as_api.codex_config import CodexConfig
 from codex_as_api.provider import SIWC_BASE_URL
+from codex_as_api.siwc_transport import SIWCWebSocketPool
 
 from . import test_siwc_provider
 
@@ -121,6 +122,21 @@ def test_siwc_health_reports_installed_vcs_revision(siwc_client, monkeypatch):
     assert "catalog_fetched_at" in body and "catalog_expires_at" in body
     assert "context_window" in body and "auto_compact_token_limit" in body
     assert "url" not in body and "auth_path" not in body
+
+
+@pytest.mark.parametrize("limit", [None, 7, 32])
+def test_siwc_health_reports_the_running_pool_capacity(siwc_client, monkeypatch, limit):
+    client, provider, _ = siwc_client
+    pool = SIWCWebSocketPool(limit=limit) if limit is not None else None
+    monkeypatch.setattr(provider, "_siwc_websockets", pool)
+    try:
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["upstream_max_connections"] == limit
+        assert response.json()["upstream_active_requests"] == 0
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def test_siwc_health_does_not_claim_an_update_before_process_restart(siwc_client, monkeypatch):

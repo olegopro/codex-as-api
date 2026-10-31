@@ -166,16 +166,27 @@ def test_sibling_histories_keep_separate_warm_channels(monkeypatch):
 
 
 @pytest.mark.parametrize("identical_prompts", [False, True])
-def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts):
+@pytest.mark.parametrize("concurrency", [2, 20, 32])
+def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts, concurrency):
     sockets = []
     observed_active = []
-    rendezvous = threading.Barrier(2, action=lambda: observed_active.append(pool.active_requests))
     pool = SIWCWebSocketPool()
+    assert pool.max_connections == 32
+
+    def at_peak():
+        observed_active.append(pool.active_requests)
+        if concurrency == pool.max_connections:
+            with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
+                list(pool.events({"prompt_cache_key": "overflow"}, account_id="account",
+                                 access_token="synthetic", timeout=1))
+            assert caught.value.status == 429
+
+    rendezvous = threading.Barrier(concurrency, action=at_peak)
 
     class ConcurrentSocket(FakeSocket):
         def recv(self, *, timeout):
-            # Both independent generations must enter recv before either finishes.
-            rendezvous.wait(timeout=2)
+            # Every independent generation must enter recv before any finishes.
+            rendezvous.wait(timeout=5)
             return super().recv(timeout=timeout)
 
     def connect(*_args, **_kwargs):
@@ -190,10 +201,10 @@ def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, ide
 
     monkeypatch.setattr(siwc_transport, "connect", connect)
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(request, index) for index in range(2)]
-            assert all(future.result(timeout=4)[-1]["type"] == "response.completed" for future in futures)
-        assert len(sockets) == 2 and pool.active_requests == 0 and observed_active == [2]
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(request, index) for index in range(concurrency)]
+            assert all(future.result(timeout=10)[-1]["type"] == "response.completed" for future in futures)
+        assert len(sockets) == concurrency and pool.active_requests == 0 and observed_active == [concurrency]
     finally:
         pool.close()
 
@@ -218,6 +229,41 @@ def test_saturated_same_branch_fails_explicitly_instead_of_waiting(monkeypatch):
         finally:
             first.close()
             pool.close()
+
+
+@pytest.mark.parametrize("expire", [False, True])
+def test_many_idle_channels_close_concurrently(monkeypatch, expire):
+    rendezvous = threading.Barrier(8)
+    sockets = []
+
+    class ClosingSocket(FakeSocket):
+        def close(self):
+            if not self.closed and self in sockets[:8]:
+                rendezvous.wait(timeout=3)
+            super().close()
+
+    def connect(*_args, **_kwargs):
+        socket = ClosingSocket([{"type": "response.completed"}])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 100)
+    pool = SIWCWebSocketPool(idle_timeout=10)
+    try:
+        for index in range(8):
+            list(pool.events({"prompt_cache_key": str(index)}, account_id="account",
+                             access_token="synthetic", timeout=1))
+        if expire:
+            monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 111)
+            list(pool.events({"prompt_cache_key": "new"}, account_id="account",
+                             access_token="synthetic", timeout=1))
+        else:
+            pool.close()
+        assert all(socket.closed for socket in sockets[:8])
+        assert pool.active_requests == 0
+    finally:
+        pool.close()
 
 
 @pytest.mark.parametrize("failure", ["invalid-json", OSError("synthetic disconnect"),

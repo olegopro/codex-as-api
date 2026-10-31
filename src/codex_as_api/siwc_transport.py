@@ -13,6 +13,7 @@ import urllib.error
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,12 +65,16 @@ class _Connection:
 class SIWCWebSocketPool:
     """Warm channels per account/session/model/branch, with bounded concurrent leases."""
 
-    def __init__(self, *, limit: int = 16, idle_timeout: float = 1800.0) -> None:
+    def __init__(self, *, limit: int = 32, idle_timeout: float = 1800.0) -> None:
         self._limit = limit
         self._idle_timeout = idle_timeout
         self._lock = threading.Lock()
         self._connections: OrderedDict[tuple[str, str, str, str, int], _Connection] = OrderedDict()
         self._closed = False
+
+    @property
+    def max_connections(self) -> int:
+        return self._limit
 
     @property
     def active_requests(self) -> int:
@@ -104,8 +109,7 @@ class SIWCWebSocketPool:
             # An active channel is never leased twice, even for identical prompts.
             entry.users = 1
             self._connections.move_to_end(available)
-        for candidate in expired:
-            candidate.close()
+        _close_connections(expired)
         return entry
 
     def events(
@@ -228,5 +232,14 @@ class SIWCWebSocketPool:
             self._closed = True
             entries = list(self._connections.values())
             self._connections.clear()
+        _close_connections(entries)
+
+
+def _close_connections(entries: list[_Connection]) -> None:
+    if len(entries) < 2:
         for entry in entries:
             entry.close()
+        return
+    # Bound cleanup time without keeping another thread pool alive between calls.
+    with ThreadPoolExecutor(max_workers=min(8, len(entries))) as workers:
+        list(workers.map(lambda entry: entry.close(), entries))

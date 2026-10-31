@@ -1842,6 +1842,8 @@ def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
         "package_revision": _RUNNING_PACKAGE_REVISION,
         "upstream_active_requests": (provider._siwc_websockets.active_requests
                                      if provider._siwc_websockets is not None else 0),
+        "upstream_max_connections": (provider._siwc_websockets.max_connections
+                                     if provider._siwc_websockets is not None else None),
     }
 
 
