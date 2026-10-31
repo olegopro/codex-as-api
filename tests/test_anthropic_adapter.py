@@ -22,6 +22,7 @@ from codex_as_api.messages import (
     ToolCall,
     Usage,
 )
+from codex_as_api.provider import _messages_to_response_items
 from codex_as_api.reasoning_signature import (
     REASONING_COMPATIBLE_MODELS,
     REASONING_SIGNATURE_PREFIX,
@@ -38,6 +39,62 @@ from codex_as_api.reasoning_signature import (
 
 
 class TestAnthropicRequestToInternal:
+    @pytest.mark.parametrize("after_tool", [False, True])
+    def test_text_image_order_survives_full_history_conversion(self, after_tool):
+        content = [
+            {"type": "text", "text": "caption A"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            {"type": "text", "text": "caption B"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/b.png"}},
+        ]
+        if after_tool:
+            content.insert(0, {"type": "tool_result", "tool_use_id": "call", "content": "done"})
+        messages, *_ = anthropic_request_to_internal(model="test", messages=[{"role": "user", "content": content}])
+        items = _messages_to_response_items(messages)
+        assert items[-1]["content"] == [
+            {"type": "input_text", "text": "caption A"},
+            {"type": "input_image", "image_url": "https://example.com/a.png"},
+            {"type": "input_text", "text": "caption B"},
+            {"type": "input_image", "image_url": "https://example.com/b.png"},
+        ]
+        if after_tool:
+            assert items[0] == {"type": "function_call_output", "call_id": "call", "output": "done"}
+
+    @pytest.mark.parametrize("with_reasoning", [False, True])
+    def test_assistant_text_tools_and_reasoning_keep_their_positions(self, with_reasoning):
+        reasoning = {"type": "reasoning", "id": "rs_order", "encrypted_content": "synthetic", "summary": []}
+        content = [
+            {"type": "text", "text": "before"},
+            {"type": "tool_use", "id": "call1", "name": "read", "input": {}},
+            {"type": "text", "text": "between"},
+            {"type": "tool_use", "id": "call2", "name": "read", "input": {}},
+            {"type": "text", "text": "after"},
+        ]
+        if with_reasoning:
+            content.insert(2, {"type": "thinking", "thinking": "", "signature": encode_reasoning_signature(
+                model="gpt-5.6-sol", item=reasoning)})
+        messages, *_ = anthropic_request_to_internal(
+            model="test", backend_model="gpt-5.6-sol", messages=[{"role": "assistant", "content": content}],
+        )
+        items = _messages_to_response_items(messages, backend_model="gpt-5.6-sol")
+        expected = ["message", "function_call", "message", "function_call", "message"]
+        if with_reasoning:
+            expected.insert(2, "reasoning")
+            assert items[2] == reasoning
+        assert [item["type"] for item in items] == expected
+        assert [item["content"][0]["text"] for item in items if item["type"] == "message"] == [
+            "before", "between", "after",
+        ]
+        assert [item["call_id"] for item in items if item["type"] == "function_call"] == ["call1", "call2"]
+
+    def test_duplicate_call_id_is_rejected_across_text_boundaries(self):
+        with pytest.raises(ValueError, match="duplicate id"):
+            anthropic_request_to_internal(model="test", messages=[{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "same", "name": "read", "input": {}},
+                {"type": "text", "text": "between"},
+                {"type": "tool_use", "id": "same", "name": "read", "input": {}},
+            ]}])
+
     def test_system_string(self):
         messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",

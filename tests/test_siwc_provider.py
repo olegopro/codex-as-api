@@ -465,16 +465,36 @@ def test_siwc_explicit_transport_error_is_not_ignored(siwc_provider, error_line)
     assert "synthetic-access" not in str(caught.value)
 
 
-def test_siwc_duplicate_call_ids_are_rejected(siwc_provider):
+@pytest.mark.parametrize("streamed,empty_completed", [(False, False), (True, False), (True, True)])
+def test_siwc_duplicate_call_ids_are_rejected(siwc_provider, streamed, empty_completed):
     item = {"type": "function_call", "name": "read", "namespace": SIWC_TOOL_NAMESPACE,
-            "arguments": "{}", "call_id": "call_duplicate"}
-    provider, _ = siwc_provider(events=[_completed([item, item])])
+            "arguments": "{}", "call_id": "call_duplicate", "id": "fc_first"}
+    duplicate = {**item, "id": "fc_second", "arguments": '{"different":true}'}
+    output = [item, duplicate]
+    wire = [{"type": "response.output_item.done", "item": part} for part in output] if streamed else []
+    wire.append(_completed([] if empty_completed else output))
+    provider, _ = siwc_provider(events=wire)
     events = []
     with pytest.raises(ChatGPTOAuthProtocolError):
         events.extend(provider.chat_stream(
             _messages(), tools=[ToolSchema(name="read", description="Чтение", parameters={})],
         ))
     assert not any(event["type"] == "tool_call" for event in events)
+
+
+@pytest.mark.parametrize("invalid", [{"arguments": "{"}, {"status": "incomplete"}, {"name": "unknown"}])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_siwc_invalid_late_call_never_releases_an_earlier_call(siwc_provider, invalid, streamed):
+    valid = {"type": "function_call", "name": "read", "namespace": SIWC_TOOL_NAMESPACE,
+             "arguments": "{}", "call_id": "first", "status": "completed"}
+    output = [valid, {**valid, "call_id": "second", **invalid}]
+    wire = [{"type": "response.output_item.done", "item": item} for item in output] if streamed else []
+    wire.append(_completed([] if streamed else output))
+    provider, _ = siwc_provider(events=wire)
+    events = []
+    with pytest.raises(ChatGPTOAuthProtocolError):
+        events.extend(provider.chat_stream(_messages(), tools=[ToolSchema(name="read", description="", parameters={})]))
+    assert not any(event["type"] in {"tool_call", "finish"} for event in events)
 
 
 def test_siwc_failed_status_inside_completed_is_rejected(siwc_provider):

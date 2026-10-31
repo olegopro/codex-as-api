@@ -208,6 +208,7 @@ _ANTHROPIC_COMPACT_FIELDS = frozenset(
 )
 
 _provider: ChatGPTOAuthProvider | None = None
+_anthropic_cancel_limiter = anyio.CapacityLimiter(8)
 
 
 def _get_provider() -> ChatGPTOAuthProvider:
@@ -272,7 +273,8 @@ async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> 
             try:
                 if not finished and cancel is not None:
                     with anyio.CancelScope(shield=True):
-                        await run_in_threadpool(cancel.cancel)
+                        # Приёмники/preflight могут занять все общие рабочие потоки.
+                        await anyio.to_thread.run_sync(cancel.cancel, limiter=_anthropic_cancel_limiter)
             finally:
                 tasks.cancel_scope.cancel()
 

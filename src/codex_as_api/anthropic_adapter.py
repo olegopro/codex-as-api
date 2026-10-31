@@ -125,6 +125,7 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
         raise ValueError("Anthropic user message content blocks must be non-empty")
     text_parts: list[str] = []
     image_urls: list[str] = []
+    content_parts: list[dict[str, object]] = []
     for index, block in enumerate(content):
         if not isinstance(block, dict):
             raise ValueError(f"Anthropic user content block {index} must be an object")
@@ -144,6 +145,7 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
             if not isinstance(text, str):
                 raise ValueError(f"Anthropic user text block {index} requires string text")
             text_parts.append(text)
+            content_parts.append({"type": "input_text", "text": text})
         elif block_type == "tool_result":
             _reject_unknown_fields(
                 block,
@@ -156,10 +158,12 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
                         role=MessageRole.USER,
                         content="".join(text_parts),
                         images=tuple(image_urls),
+                        content_parts=tuple(content_parts),
                     )
                 )
                 text_parts = []
                 image_urls = []
+                content_parts = []
             tool_use_id = block.get("tool_use_id")
             if not isinstance(tool_use_id, str):
                 raise ValueError(f"Anthropic tool_result block {index} requires string tool_use_id")
@@ -227,14 +231,18 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
             source = block.get("source")
             image_url = _anthropic_image_url(source)
             image_urls.append(image_url)
+            content_parts.append({"type": "input_image", "image_url": image_url})
         else:
-            text_parts.append(_render_anthropic_content_block(block))
+            text = _render_anthropic_content_block(block)
+            text_parts.append(text)
+            content_parts.append({"type": "input_text", "text": text})
     if text_parts or image_urls:
         out.append(
             Message(
                 role=MessageRole.USER,
                 content="".join(text_parts),
                 images=tuple(image_urls),
+                content_parts=tuple(content_parts),
             )
         )
 
@@ -257,6 +265,16 @@ def _convert_assistant_message(
     tool_calls: list[ToolCall] = []
     tool_call_ids: set[str] = set()
     reasoning_items: list[dict[str, Any]] = []
+    start = len(out)
+
+    def flush() -> None:
+        if text_parts or tool_calls or reasoning_items:
+            out.append(Message(role=MessageRole.ASSISTANT, content="".join(text_parts),
+                               tool_calls=tuple(tool_calls), reasoning_items=tuple(reasoning_items)))
+            text_parts.clear()
+            tool_calls.clear()
+            reasoning_items.clear()
+
     for index, block in enumerate(content):
         if not isinstance(block, dict):
             raise ValueError(f"Anthropic assistant content block {index} must be an object")
@@ -275,6 +293,8 @@ def _convert_assistant_message(
             text = block.get("text")
             if not isinstance(text, str):
                 raise ValueError(f"Anthropic assistant text block {index} requires string text")
+            if tool_calls:
+                flush()
             text_parts.append(text)
         elif block_type == "tool_use":
             _reject_unknown_fields(
@@ -315,6 +335,8 @@ def _convert_assistant_message(
             if signature is not None and not isinstance(signature, str):
                 raise ValueError(f"Anthropic assistant thinking block {index} signature must be a string")
             if is_recognized_reasoning_signature(signature):
+                if text_parts or tool_calls:
+                    flush()
                 envelope = decode_reasoning_signature(cast(str, signature))
                 if backend_model is None:
                     reasoning_items.append(envelope)
@@ -342,15 +364,12 @@ def _convert_assistant_message(
                 f"Anthropic assistant content block type {block_type!r} cannot be preserved by this facade"
             )
         else:
+            if tool_calls:
+                flush()
             text_parts.append(_render_anthropic_content_block(block))
-    out.append(
-        Message(
-            role=MessageRole.ASSISTANT,
-            content="".join(text_parts),
-            tool_calls=tuple(tool_calls) if tool_calls else (),
-            reasoning_items=tuple(reasoning_items),
-        )
-    )
+    flush()
+    if len(out) == start:
+        out.append(Message(role=MessageRole.ASSISTANT, content=""))
 
 
 def _convert_tools(tools: object) -> list[ToolSchema]:

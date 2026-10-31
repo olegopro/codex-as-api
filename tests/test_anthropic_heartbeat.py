@@ -74,6 +74,55 @@ def test_heartbeat_cancels_only_an_unfinished_request():
     anyio.run(exercise)
 
 
+def test_cancellation_bypasses_saturated_shared_workers():
+    stream_release, prep_release = threading.Event(), threading.Event()
+    cancellation_threads = []
+
+    async def exercise():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 2
+        stream_waiting, prep_waiting, done = anyio.Event(), anyio.Event(), anyio.Event()
+        scopes = []
+
+        def cancel():
+            cancellation_threads.append(threading.get_ident())
+            stream_release.set()
+
+        def chunks():
+            yield "first"
+            anyio.from_thread.run_sync(stream_waiting.set)
+            assert stream_release.wait(3), "cancel did not release upstream"
+
+        def prepare():
+            anyio.from_thread.run_sync(prep_waiting.set)
+            assert prep_release.wait(3), "test did not release preparation"
+
+        async def consume():
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                async for _ in server._anthropic_heartbeat(chunks(), cancel=SimpleNamespace(cancel=cancel)):
+                    pass
+            done.set()
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume)
+            await stream_waiting.wait()
+            tasks.start_soon(anyio.to_thread.run_sync, prepare)
+            await prep_waiting.wait()
+            assert limiter.borrowed_tokens == 2
+            scopes[0].cancel()
+            try:
+                with anyio.fail_after(1):
+                    await done.wait()
+                assert cancellation_threads and cancellation_threads[0] != threading.get_ident()
+                assert not prep_release.is_set()
+            finally:
+                prep_release.set()
+                stream_release.set()
+
+    anyio.run(exercise)
+
+
 @pytest.mark.parametrize("terminal", ["event: error\n\n", "event: message_stop\n\n"])
 def test_idle_timer_never_loses_data_or_terminal_frames(monkeypatch, terminal):
     expected = [f"chunk-{i}" for i in range(100)] + [terminal]

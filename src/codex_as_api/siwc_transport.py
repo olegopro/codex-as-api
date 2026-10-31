@@ -14,7 +14,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +43,49 @@ def _branch_key(payload: dict[str, Any]) -> str:
                                      separators=(",", ":")).encode()).hexdigest()
 
 
+def _fingerprint(value: Any) -> bytes:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode()).digest()
+
+
+def _is_output_item(item: dict[str, Any]) -> bool:
+    return item.get("role") == "assistant" or item.get("type") in {
+        "reasoning", "function_call", "web_search_call",
+    }
+
+
+def _output_key(items: list[dict[str, Any]]) -> bytes:
+    # Только сравнение replay: wire-ответы и история не меняются. Фасад объединяет
+    # текст и выдаёт tools в конце; служебные id/status сообщения в replay исчезают.
+    text: list[str] = []
+    reasoning: list[Any] = []
+    calls: list[Any] = []
+    other: list[Any] = []
+    for item in items:
+        typ = item.get("type")
+        if item.get("role") == "assistant":
+            content = item.get("content", [])
+            if isinstance(content, str):
+                text.append(content)
+            else:
+                text.extend(part["text"] for part in content
+                            if part.get("type") in {"text", "input_text", "output_text"})
+        elif typ == "reasoning":
+            reasoning.append((item.get("id"), item.get("encrypted_content"),
+                              [p.get("text") for p in item.get("summary", [])],
+                              [p.get("text") for p in item.get("content", [])]))
+        elif typ == "function_call":
+            arguments = item.get("arguments")
+            if isinstance(arguments, str):
+                # Валидация остаётся в provider, здесь только отпечаток.
+                with suppress(ValueError):
+                    arguments = strict_json_loads(arguments)
+            calls.append((item.get("call_id"), str(item.get("name", "")).rsplit(".", 1)[-1], arguments))
+        else:
+            other.append(item)
+    return _fingerprint(("".join(text), reasoning, calls, other))
+
+
 @dataclass
 class _Connection:
     lock: Any = field(default_factory=threading.Lock)
@@ -52,6 +95,8 @@ class _Connection:
     token_hash: str = ""
     stack: ExitStack = field(default_factory=ExitStack)
     socket: Any = None
+    history: tuple[bytes, ...] | None = None
+    output_key: bytes | None = None
 
     def close(self) -> None:
         try:
@@ -60,6 +105,8 @@ class _Connection:
             self.stack = ExitStack()
             self.socket = None
             self.token_hash = ""
+            self.history = None
+            self.output_key = None
 
 
 class SIWCWebSocketPool:
@@ -81,8 +128,29 @@ class SIWCWebSocketPool:
         with self._lock:
             return sum(entry.users for entry in self._connections.values())
 
-    def _reserve(self, key: tuple[str, str, str, str]) -> _Connection:
+    def _reserve(self, key: tuple[str, str, str, str], inputs: list[dict[str, Any]]) -> _Connection:
         expired = []
+        history = tuple(_fingerprint(item) for item in inputs)
+        replay_keys: dict[int, bytes] = {}
+
+        def affinity(candidate: _Connection) -> int:
+            previous = candidate.history
+            if previous is None:
+                return 0
+            if history == previous:
+                return len(previous) + 1  # Точный повтор тоже сохраняет канал.
+            size = len(previous)
+            if history[:size] != previous or candidate.output_key is None:
+                return -1
+            if size not in replay_keys:
+                replay = []
+                for item in inputs[size:]:
+                    if not _is_output_item(item):
+                        break
+                    replay.append(item)
+                replay_keys[size] = _output_key(replay)
+            return size + 1 if replay_keys[size] == candidate.output_key else -1
+
         now = time.monotonic()
         with self._lock:
             if self._closed:
@@ -90,8 +158,10 @@ class SIWCWebSocketPool:
             for old_key, candidate in list(self._connections.items()):
                 if candidate.users == 0 and now - candidate.last_used >= self._idle_timeout:
                     expired.append(self._connections.pop(old_key))
-            available = next((k for k, v in reversed(self._connections.items())
-                              if k[:4] == key and v.users == 0), None)
+            candidates = ((affinity(v), k) for k, v in reversed(self._connections.items())
+                          if k[:4] == key and v.users == 0)
+            best = max(candidates, key=lambda candidate: candidate[0], default=(-1, None))
+            available = best[1] if best[0] >= 0 else None
             if available is None:
                 if len(self._connections) >= self._limit:
                     victim = next((k for k, v in self._connections.items() if v.users == 0), None)
@@ -108,6 +178,8 @@ class SIWCWebSocketPool:
                 entry = self._connections[available]
             # An active channel is never leased twice, even for identical prompts.
             entry.users = 1
+            entry.history = history
+            entry.output_key = None
             self._connections.move_to_end(available)
         _close_connections(expired)
         return entry
@@ -123,7 +195,9 @@ class SIWCWebSocketPool:
     ) -> Iterator[dict[str, Any]]:
         key = (account_id, payload.get("prompt_cache_key") or "anonymous",
                payload.get("model", ""), _branch_key(payload))
-        entry = self._reserve(key)
+        entry = self._reserve(key, payload.get("input", []))
+        history = entry.history
+        output: list[dict[str, Any]] = []
         token_hash = hashlib.sha256(access_token.encode()).hexdigest()
         request_id = uuid.uuid4().hex[:12]
         session_hash = hashlib.sha256(key[1].encode()).hexdigest()[:12]
@@ -182,10 +256,19 @@ class SIWCWebSocketPool:
                                     first_delta_ms = elapsed_ms
                                 if event["type"] in {"codex.response.metadata", "responsesapi.websocket_timing"}:
                                     continue
+                                if event["type"] == "response.output_item.done" and isinstance(event.get("item"), dict):
+                                    output.append(event["item"])
                                 if event["type"] in _TERMINAL_EVENTS:
                                     completed = event["type"] == "response.completed"
                                     if completed:
                                         response = event.get("response")
+                                        final_output = response.get("output") if isinstance(response, dict) else None
+                                        entry.history = history
+                                        try:
+                                            entry.output_key = _output_key(final_output or output)
+                                        except (TypeError, ValueError, KeyError, AttributeError):
+                                            # Невалидный ответ проверит provider, не подбор канала.
+                                            entry.output_key = None
                                         usage = response.get("usage") if isinstance(response, dict) else None
                                         if isinstance(usage, dict):
                                             details = usage.get("input_tokens_details")

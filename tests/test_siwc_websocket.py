@@ -15,7 +15,7 @@ from websockets.protocol import State
 from codex_as_api import provider as provider_module
 from codex_as_api import siwc_transport
 from codex_as_api.auth import ChatGPTOAuthProtocolError, ChatGPTOAuthUpstreamError
-from codex_as_api.messages import Message, MessageRole
+from codex_as_api.messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from codex_as_api.provider import ChatGPTOAuthProvider
 from codex_as_api.siwc_transport import SIWCWebSocketPool
 
@@ -111,7 +111,9 @@ def test_siwc_websocket_sessions_do_not_share_a_channel(websocket_provider):
 
 
 def test_claude_code_late_system_notes_keep_the_same_channel_and_history_prefix(websocket_provider):
-    provider, sockets, calls, _ = websocket_provider()
+    provider, sockets, calls, _ = websocket_provider(events=[
+        test_siwc_provider._completed([test_siwc_provider._text_item("Earlier answer")]),
+    ])
     first = [
         Message(role=MessageRole.SYSTEM, content="Stable system prompt"),
         Message(role=MessageRole.USER, content="Read the fixture"),
@@ -146,7 +148,7 @@ def test_sibling_histories_keep_separate_warm_channels(monkeypatch):
     sockets = []
 
     def connect(*_args, **_kwargs):
-        sock = FakeSocket([{"type": "response.completed"}])
+        sock = FakeSocket([test_siwc_provider._completed([test_siwc_provider._text_item("Earlier answer")])])
         sockets.append(sock)
         return sock
 
@@ -161,6 +163,137 @@ def test_sibling_histories_keep_separate_warm_channels(monkeypatch):
             list(pool.events(payload, account_id="account", access_token="synthetic", timeout=1))
         assert len(sockets) == 2
         assert [len(sock.sent) for sock in sockets] == [2, 2]
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("identical_prompts", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_diverged_full_histories_reuse_their_own_warm_sockets(monkeypatch, identical_prompts, with_tools):
+    sockets, outputs = [], []
+
+    def connect(*_args, **_kwargs):
+        label = str(len(sockets))
+        output = [test_siwc_provider._text_item("answer " + label)]
+        if with_tools:
+            output.insert(0, {"type": "reasoning", "id": "rs_" + label,
+                              "encrypted_content": "cipher_" + label, "summary": [], "status": "completed"})
+            output.append({"type": "function_call", "id": "fc_" + label, "call_id": "call_" + label,
+                           "name": "codex_as_api.read", "arguments": '{"b": 2, "a": 1}', "status": "completed"})
+        outputs.append(output)
+        events = [{"type": "response.created"}]
+        events.extend({"type": "response.output_item.done", "item": item} for item in output)
+        events.append(test_siwc_provider._completed([]))
+        socket = FakeSocket(events)
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool(limit=2)
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    base = {"prompt_cache_key": "same-session", "model": "same-model", "instructions": "stable"}
+    histories = [
+        [{"role": "user", "content": "root"}, {"role": "assistant", "content": "shared"},
+         {"role": "user", "content": "same" if identical_prompts else label}]
+        for label in ("A", "B")
+    ]
+    try:
+        streams = [pool.events({**base, "input": history}, **options) for history in histories]
+        for stream in streams:
+            next(stream)
+        assert pool.active_requests == 2
+        for stream in streams:
+            list(stream)
+        for _ in range(2):
+            for index, history in enumerate(histories):
+                replay = []
+                for item in outputs[index]:
+                    copied = {key: value for key, value in item.items() if key != "status"}
+                    if item["type"] == "function_call":
+                        copied.pop("id")
+                        copied.update(name="read", namespace="codex_as_api", arguments='{"a":1,"b":2}')
+                    replay.append(copied)
+                history.extend(replay)
+                history.append({"role": "user", "content": "continue"})
+                list(pool.events({**base, "input": history}, **options))
+                assert sockets[index].sent[-1]["input"] == history
+        assert len(sockets) == 2
+        assert [len(socket.sent) for socket in sockets] == [3, 3]
+        for connection in pool._connections.values():
+            assert all(isinstance(part, bytes) and len(part) == 32 for part in connection.history)
+            assert isinstance(connection.output_key, bytes)
+    finally:
+        pool.close()
+
+
+def test_affinity_survives_anthropic_reasoning_and_tool_replay(websocket_provider, monkeypatch):
+    provider, _, _, _ = websocket_provider()
+    sockets, outputs = [], []
+    original_name = "synthetic.read-file"
+    wire_name = provider_module._siwc_wire_name(original_name)
+    tools = [ToolSchema(name=original_name, description="", parameters={})]
+
+    def connect(*_args, **_kwargs):
+        label = str(len(sockets))
+        reasoning = {"type": "reasoning", "id": "rs_" + label, "encrypted_content": "cipher_" + label, "summary": []}
+        call = {"type": "function_call", "name": "codex_as_api." + wire_name,
+                "call_id": "call_" + label, "arguments": '{"path": "fixture"}', "status": "completed"}
+        output = [reasoning, test_siwc_provider._text_item("answer " + label), call]
+        outputs.append(output)
+        socket = FakeSocket([*[{"type": "response.output_item.done", "item": item} for item in output],
+                             test_siwc_provider._completed([])])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    streams = [provider.chat_stream(test_siwc_provider._messages(), tools=tools, prompt_cache_key="same-session")
+               for _ in range(2)]
+    for stream in streams:
+        assert next(stream)["type"] == "reasoning_item"
+    for stream in streams:
+        list(stream)
+    for index, output in enumerate(outputs[:]):
+        call = output[-1]
+        response = AssistantResponse(
+            content="answer " + str(index), finish_reason="tool_calls", reasoning_items=(output[0],),
+            usage=Usage(prompt_tokens=20, completion_tokens=3, total_tokens=23),
+            tool_calls=(ToolCall(id=call["call_id"], name=original_name, arguments=call["arguments"]),),
+        )
+        converted = test_siwc_provider.internal_response_to_anthropic(
+            response, "claude-synthetic", "msg_fixture", backend_model="synthetic-first",
+        )
+        messages, replay_tools, *_ = test_siwc_provider.anthropic_request_to_internal(
+            model="claude-synthetic", system="Правила", backend_model="synthetic-first",
+            messages=[{"role": "user", "content": "Вопрос"},
+                      {"role": "assistant", "content": converted["content"]},
+                      {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call["call_id"],
+                                                    "content": "done"}]}],
+            tools=[{"name": original_name, "input_schema": {}}],
+        )
+        provider.chat(messages, tools=replay_tools, prompt_cache_key="same-session")
+        assert len(sockets) == 2 and len(sockets[index].sent) == 2
+
+
+def test_rewritten_output_does_not_reuse_an_incompatible_warm_channel(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        socket = FakeSocket([test_siwc_provider._completed([test_siwc_provider._text_item("original")])])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    original = {"input": [{"role": "user", "content": "root"}]}
+    try:
+        list(pool.events(original, **options))
+        changed = {"input": [*original["input"], {"role": "assistant", "content": "edited"},
+                             {"role": "user", "content": "continue"}]}
+        list(pool.events(changed, **options))
+        assert len(sockets) == 2
+        list(pool.events(original, **options))
+        assert len(sockets) == 2 and len(sockets[0].sent) == 2
     finally:
         pool.close()
 

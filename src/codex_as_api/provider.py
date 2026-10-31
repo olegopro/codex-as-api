@@ -2108,7 +2108,8 @@ def _siwc_response_events(stream: Iterator[dict[str, Any]]) -> Iterator[dict[str
         if not isinstance(final_output, list):
             raise ChatGPTOAuthProtocolError("response.completed: отсутствует массив output")
         call_ids: set[str] = set()
-        for item in final_output:
+        # В SIWC completed.output часто пуст: проверяются уже полученные элементы.
+        for item in final_output or output:
             if not isinstance(item, dict):
                 raise ChatGPTOAuthProtocolError("Элемент output должен быть объектом")
             _validate_response_output_item(item)
