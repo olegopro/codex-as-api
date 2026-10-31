@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import jwt
 import pytest
@@ -66,6 +67,34 @@ def sign(monkeypatch):
 @pytest.fixture()
 def grant(tmp_path, sign):
     return create_grant(tmp_path / "siwc" / "credentials.json", sign)
+
+
+def test_new_host_id_is_stable_uuid_urn(tmp_path):
+    path = tmp_path / "credentials.json"
+    first = siwc_auth._registration_for_login(path)
+    host = first["ext_agent_host_id"]
+    assert uuid.UUID(host).version == 4
+    assert uuid.UUID(host).urn == host
+    assert siwc_auth._registration_for_login(path)["ext_agent_host_id"] == host
+
+
+@pytest.mark.parametrize("issued_client", [None, "issued-offline-client"])
+def test_only_unregistered_legacy_host_id_is_migrated(tmp_path, issued_client):
+    path = tmp_path / "credentials.json"
+    old_host = "old_urlsafe_host_identifier"
+    auth._write_auth_json(path, {"oauth_profile": "siwc", "version": 1, "registration": {
+        "client_id": issued_client, "ext_agent_host_id": old_host,
+        "resource": siwc_auth.RESOURCE, "registration_id": "offline-registration",
+    }})
+    result = siwc_auth._registration_for_login(path)
+    if issued_client is None:
+        assert result["ext_agent_host_id"] != old_host
+        assert uuid.UUID(result["ext_agent_host_id"]).urn == result["ext_agent_host_id"]
+        assert result["registration_id"] != "offline-registration"
+    else:
+        assert result["ext_agent_host_id"] == old_host
+        assert result["registration_id"] == "offline-registration"
+        assert result["client_id"] == issued_client
 
 
 def test_siwc_identity_is_verified_without_private_chatgpt_claims(grant):

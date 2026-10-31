@@ -157,11 +157,21 @@ def _registration_for_login(path: pathlib.Path) -> dict[str, Any]:
         data = _read_document(path)
         if data is None:
             data = {"oauth_profile": OAUTH_PROFILE, "version": 1, "registration": {
-                "client_id": None, "ext_agent_host_id": secrets.token_urlsafe(32),
+                "client_id": None, "ext_agent_host_id": uuid.uuid4().urn,
                 "resource": RESOURCE, "registration_id": uuid.uuid4().hex,
             }}
             auth._write_auth_json(path, data)
         registration = _registration(data)
+        if registration.get("client_id") is None and "tokens" not in data:
+            host_id = registration["ext_agent_host_id"]
+            try:
+                canonical_host = uuid.UUID(host_id).urn == host_id
+            except ValueError:
+                canonical_host = False
+            if not canonical_host:
+                registration["ext_agent_host_id"] = uuid.uuid4().urn
+                registration["registration_id"] = uuid.uuid4().hex
+                auth._write_auth_json(path, data)
         subject = None
         if "tokens" in data:
             subject = token_data_from_document(data, path).user_id
