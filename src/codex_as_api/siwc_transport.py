@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import urllib.error
+import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, nullcontext
@@ -26,6 +27,19 @@ from .strict_json import strict_json_loads
 SIWC_WEBSOCKET_URL = "wss://api.openai.com/v1/responses"
 _TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
 _LOG = logging.getLogger(__name__)
+
+
+def _branch_key(payload: dict[str, Any]) -> str:
+    # Claude Code gives siblings the parent's session ID. The initial user turn
+    # and instructions distinguish their histories without retaining prompt text.
+    initial_input = []
+    for item in payload.get("input", []):
+        initial_input.append(item)
+        if isinstance(item, dict) and item.get("role") == "user":
+            break
+    identity = (payload.get("instructions"), initial_input)
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 
 @dataclass
@@ -48,16 +62,21 @@ class _Connection:
 
 
 class SIWCWebSocketPool:
-    """One serialized channel per account/session/model, with lazy idle/LRU eviction."""
+    """Warm channels per account/session/model/branch, with bounded concurrent leases."""
 
     def __init__(self, *, limit: int = 16, idle_timeout: float = 1800.0) -> None:
         self._limit = limit
         self._idle_timeout = idle_timeout
         self._lock = threading.Lock()
-        self._connections: OrderedDict[tuple[str, str, str], _Connection] = OrderedDict()
+        self._connections: OrderedDict[tuple[str, str, str, str, int], _Connection] = OrderedDict()
         self._closed = False
 
-    def _reserve(self, key: tuple[str, str, str]) -> _Connection:
+    @property
+    def active_requests(self) -> int:
+        with self._lock:
+            return sum(entry.users for entry in self._connections.values())
+
+    def _reserve(self, key: tuple[str, str, str, str]) -> _Connection:
         expired = []
         now = time.monotonic()
         with self._lock:
@@ -66,17 +85,25 @@ class SIWCWebSocketPool:
             for old_key, candidate in list(self._connections.items()):
                 if candidate.users == 0 and now - candidate.last_used >= self._idle_timeout:
                     expired.append(self._connections.pop(old_key))
-            entry = self._connections.get(key)
-            if entry is None:
+            available = next((k for k, v in reversed(self._connections.items())
+                              if k[:4] == key and v.users == 0), None)
+            if available is None:
                 if len(self._connections) >= self._limit:
                     victim = next((k for k, v in self._connections.items() if v.users == 0), None)
                     if victim is None:
                         raise ChatGPTOAuthUpstreamError(429, "All SIWC session channels are busy")
                     expired.append(self._connections.pop(victim))
                 entry = _Connection()
-                self._connections[key] = entry
-            entry.users += 1
-            self._connections.move_to_end(key)
+                lane = 0
+                while (*key, lane) in self._connections:
+                    lane += 1
+                available = (*key, lane)
+                self._connections[available] = entry
+            else:
+                entry = self._connections[available]
+            # An active channel is never leased twice, even for identical prompts.
+            entry.users = 1
+            self._connections.move_to_end(available)
         for candidate in expired:
             candidate.close()
         return entry
@@ -90,17 +117,27 @@ class SIWCWebSocketPool:
         timeout: float,
         cancel: Any = None,
     ) -> Iterator[dict[str, Any]]:
-        key = (account_id, payload.get("prompt_cache_key") or "anonymous", payload.get("model", ""))
+        key = (account_id, payload.get("prompt_cache_key") or "anonymous",
+               payload.get("model", ""), _branch_key(payload))
         entry = self._reserve(key)
         token_hash = hashlib.sha256(access_token.encode()).hexdigest()
+        request_id = uuid.uuid4().hex[:12]
+        session_hash = hashlib.sha256(key[1].encode()).hexdigest()[:12]
+        started = time.monotonic()
+        first_event_ms = first_delta_ms = None
+        completed = False
+        reused = False
+        _LOG.info("SIWC WS start request=%s model=%s session=%s branch=%s active=%s",
+                  request_id, key[2], session_hash, key[3][:12], self.active_requests)
         try:
             with entry.lock:
                 try:
                     if cancel is not None:
                         cancel.check()
-                    if (entry.socket is None or getattr(entry.socket, "state", State.OPEN) != State.OPEN
-                            or entry.token_hash != token_hash
-                            or time.monotonic() - entry.opened_at >= 3300.0):
+                    reused = (entry.socket is not None and getattr(entry.socket, "state", State.OPEN) == State.OPEN
+                              and entry.token_hash == token_hash
+                              and time.monotonic() - entry.opened_at < 3300.0)
+                    if not reused:
                         entry.close()
                         entry.socket = entry.stack.enter_context(connect(
                             SIWC_WEBSOCKET_URL,
@@ -116,8 +153,9 @@ class SIWCWebSocketPool:
 
                     def stop() -> None:
                         # Invalidate before close so a following request cannot reuse a closing channel.
-                        entry.token_hash = ""
-                        socket.close()
+                        if not completed:
+                            entry.token_hash = ""
+                            socket.close()
 
                     with cancel.bind(stop) if cancel is not None else nullcontext():
                         wire = {k: v for k, v in payload.items() if k != "stream"}
@@ -133,6 +171,11 @@ class SIWCWebSocketPool:
                                     raise ChatGPTOAuthProtocolError("SIWC WebSocket returned invalid JSON") from exc
                                 if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                                     raise ChatGPTOAuthProtocolError("SIWC WebSocket event must have a type")
+                                elapsed_ms = round((time.monotonic() - started) * 1000)
+                                if first_event_ms is None:
+                                    first_event_ms = elapsed_ms
+                                if first_delta_ms is None and event["type"].endswith(".delta"):
+                                    first_delta_ms = elapsed_ms
                                 if event["type"] in {"codex.response.metadata", "responsesapi.websocket_timing"}:
                                     continue
                                 if event["type"] in _TERMINAL_EVENTS:
@@ -146,9 +189,12 @@ class SIWCWebSocketPool:
                                             counters = (usage.get("input_tokens"), cached, usage.get("output_tokens"))
                                             if all(v is None or (isinstance(v, int) and not isinstance(v, bool))
                                                    for v in counters):
-                                                _LOG.info("SIWC WS model=%s input=%s cached=%s output=%s session=%s",
+                                                _LOG.info("SIWC WS model=%s input=%s cached=%s output=%s session=%s "
+                                                          "branch=%s request=%s elapsed_ms=%s first_event_ms=%s "
+                                                          "first_delta_ms=%s reused=%s",
                                                           payload.get("model"), *counters,
-                                                          hashlib.sha256(key[1].encode()).hexdigest()[:12])
+                                                          session_hash, key[3][:12], request_id, elapsed_ms,
+                                                          first_event_ms, first_delta_ms, reused)
                                     yield event
                                     return
                                 yield event
@@ -168,6 +214,11 @@ class SIWCWebSocketPool:
                     entry.close()
                     raise OSError(str(exc)) from exc
         finally:
+            if not completed:
+                _LOG.info("SIWC WS interrupted request=%s model=%s session=%s branch=%s elapsed_ms=%s "
+                          "first_event_ms=%s first_delta_ms=%s",
+                          request_id, key[2], session_hash, key[3][:12],
+                          round((time.monotonic() - started) * 1000), first_event_ms, first_delta_ms)
             with self._lock:
                 entry.users -= 1
                 entry.last_used = time.monotonic()

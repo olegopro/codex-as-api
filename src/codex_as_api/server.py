@@ -1824,6 +1824,8 @@ def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
         "upstream_base_url": SIWC_BASE_URL,
         "upstream_transport": provider.siwc_transport,
         "package_revision": _package_revision(),
+        "upstream_active_requests": (provider._siwc_websockets.active_requests
+                                     if provider._siwc_websockets is not None else 0),
     }
 
 
@@ -2967,7 +2969,10 @@ def main(argv: list[str] | None = None) -> int | None:
     logger = logging.getLogger("codex_as_api")
     if not logger.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        formatter = logging.Formatter("%(asctime)s.%(msecs)03dZ %(levelname)s: %(message)s",
+                                      datefmt="%Y-%m-%dT%H:%M:%S")
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from websockets.datastructures import Headers
@@ -114,6 +117,84 @@ def test_background_model_does_not_replace_the_main_models_channel(websocket_pro
     assert [len(sock.sent) for sock in sockets] == [2, 1]
 
 
+def test_sibling_histories_keep_separate_warm_channels(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        sock = FakeSocket([{"type": "response.completed"}])
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    try:
+        for task in ("main", "child", "main", "child"):
+            payload = {"prompt_cache_key": "same-parent", "model": "same-model",
+                       "instructions": "Stable instructions", "input": [{"role": "user", "content": task}]}
+            if task == "main" and sockets:
+                payload["input"].append({"role": "assistant", "content": "Earlier answer"})
+            list(pool.events(payload, account_id="account", access_token="synthetic", timeout=1))
+        assert len(sockets) == 2
+        assert [len(sock.sent) for sock in sockets] == [2, 2]
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("identical_prompts", [False, True])
+def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts):
+    sockets = []
+    observed_active = []
+    rendezvous = threading.Barrier(2, action=lambda: observed_active.append(pool.active_requests))
+    pool = SIWCWebSocketPool()
+
+    class ConcurrentSocket(FakeSocket):
+        def recv(self, *, timeout):
+            # Both independent generations must enter recv before either finishes.
+            rendezvous.wait(timeout=2)
+            return super().recv(timeout=timeout)
+
+    def connect(*_args, **_kwargs):
+        sock = ConcurrentSocket([{"type": "response.completed"}])
+        sockets.append(sock)
+        return sock
+
+    def request(index):
+        payload = {"prompt_cache_key": "parent", "model": "same-model",
+                   "input": [{"role": "user", "content": "same" if identical_prompts else str(index)}]}
+        return list(pool.events(payload, account_id="account", access_token="synthetic", timeout=3))
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(request, index) for index in range(2)]
+            assert all(future.result(timeout=4)[-1]["type"] == "response.completed" for future in futures)
+        assert len(sockets) == 2 and pool.active_requests == 0 and observed_active == [2]
+    finally:
+        pool.close()
+
+
+def test_saturated_same_branch_fails_explicitly_instead_of_waiting(monkeypatch):
+    monkeypatch.setattr(siwc_transport, "connect", lambda *_a, **_k:
+                        FakeSocket([{"type": "response.created"}, {"type": "response.completed"}]))
+    pool = SIWCWebSocketPool(limit=1)
+
+    def events():
+        return pool.events({"prompt_cache_key": "same", "model": "same"}, account_id="account",
+                           access_token="synthetic", timeout=1)
+
+    first = events()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            next(first)
+            future = executor.submit(lambda: list(events()))
+            with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
+                future.result(timeout=2)
+            assert caught.value.status == 429
+        finally:
+            first.close()
+            pool.close()
+
+
 @pytest.mark.parametrize("failure", ["invalid-json", OSError("synthetic disconnect"),
                                     {"type": "error", "message": "synthetic-access"}])
 def test_siwc_websocket_failure_closes_channel_without_replaying_request(websocket_provider, failure):
@@ -204,7 +285,8 @@ def test_pool_lru_evicts_only_idle_channels_and_never_reuses_across_accounts(mon
         pool.close()
 
 
-def test_cancellation_closes_only_its_channel_and_completed_requests_unbind(monkeypatch):
+@pytest.mark.parametrize("same_branch", [False, True])
+def test_cancellation_closes_only_its_channel_and_completed_requests_unbind(monkeypatch, same_branch):
     sockets = []
 
     def connect(*_args, **_kwargs):
@@ -220,12 +302,44 @@ def test_cancellation_closes_only_its_channel_and_completed_requests_unbind(monk
                         timeout=1, cancel=first_cancel)
     try:
         next(first)
-        list(pool.events({"prompt_cache_key": "two"}, account_id="account", access_token="synthetic",
-                         timeout=1, cancel=second_cancel))
+        list(pool.events({"prompt_cache_key": "one" if same_branch else "two"}, account_id="account",
+                         access_token="synthetic", timeout=1, cancel=second_cancel))
         second_cancel.cancel()
         assert not sockets[1].closed
         first_cancel.cancel()
         assert sockets[0].closed and not sockets[1].closed
     finally:
         first.close()
+        pool.close()
+
+
+def test_timing_logs_do_not_contain_prompt_or_auth(websocket_provider, caplog):
+    caplog.set_level(logging.INFO, logger="codex_as_api")
+    provider, _, _, _ = websocket_provider()
+    provider.chat(test_siwc_provider._messages(), prompt_cache_key="private-session-marker")
+    assert "SIWC WS start" in caplog.text and "elapsed_ms=" in caplog.text
+    assert "first_event_ms=" in caplog.text and "first_delta_ms=" in caplog.text
+    assert "private-session-marker" not in caplog.text and "synthetic-access" not in caplog.text
+
+
+def test_cancel_after_completed_event_keeps_the_warm_channel(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        sock = FakeSocket([{"type": "response.completed"}])
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    cancel = provider_module._RequestCancellation()
+    events = pool.events({"prompt_cache_key": "one"}, account_id="account", access_token="synthetic",
+                         timeout=1, cancel=cancel)
+    try:
+        assert next(events)["type"] == "response.completed"
+        # The SSE consumer may disconnect before resuming the upstream generator.
+        cancel.cancel()
+        assert not sockets[0].closed
+    finally:
+        events.close()
         pool.close()
