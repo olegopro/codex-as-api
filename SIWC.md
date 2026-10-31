@@ -61,6 +61,12 @@ GET каталога; при необходимости обновляет grant
 Файлы авторизации не должны попадать в git, логи, отчёты или аргументы процесса;
 каталог защищается режимом `0700`, файлы — `0600`.
 
+Проверка времени ID token допускает расхождение часов до 30 секунд (`iat`, `nbf`,
+`exp`). Подпись, issuer, audience, subject и nonce проверяются по-прежнему;
+большее расхождение отклоняется. Без допуска свежий токен на Mini отклонялся
+как ещё не выпущенный даже при погрешности 0,3 секунды. Допуск действует при
+входе и обновлении credentials; системные часы не меняются.
+
 ## Протокол
 
 - Каталог аккаунта: Bearer GET `https://api.openai.com/v1/models`.
@@ -140,3 +146,4 @@ configurable context и effective input budget не взаимозаменяем
 - [Responses WebSocket](https://developers.openai.com/api/docs/guides/websocket-mode)
 - [Аккаунты, refresh и хранение](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
 - [OIDC discovery](https://auth.openai.com/.well-known/openid-configuration)
+- [PyJWT: ограниченный допуск расхождения часов](https://pyjwt.readthedocs.io/en/stable/usage.html)

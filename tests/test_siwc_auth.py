@@ -118,6 +118,25 @@ def test_id_token_validation_rejects_invalid_claims(sign, overrides):
         siwc_auth.verify_id_token(sign(**overrides), "issued-offline-client", nonce="offline-nonce", require_nonce=True)
 
 
+@pytest.mark.parametrize("field", ["iat", "nbf"])
+def test_id_token_accepts_small_clock_skew(sign, field):
+    token = sign(**{field: int(time.time()) + 10})
+    claims = siwc_auth.verify_id_token(token, "issued-offline-client", nonce="offline-nonce", require_nonce=True)
+    assert claims["sub"] == "offline-subject"
+
+
+@pytest.mark.parametrize("field,offset", [("iat", 120), ("nbf", 120), ("exp", -120)])
+def test_id_token_rejects_clock_skew_outside_tolerance(sign, field, offset):
+    token = sign(**{field: int(time.time()) + offset})
+    with pytest.raises(auth.ChatGPTOAuthMissingError):
+        siwc_auth.verify_id_token(token, "issued-offline-client", nonce="offline-nonce", require_nonce=True)
+
+
+def test_login_accepts_fresh_id_token_with_small_clock_skew(tmp_path, sign):
+    path = create_grant(tmp_path / "siwc" / "credentials.json", lambda: sign(iat=int(time.time()) + 10))
+    assert auth.load_token_data(path).user_id == "offline-subject"
+
+
 def test_signature_algorithm_and_subject_are_not_trusted(sign):
     different_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     claims = {"iss": siwc_auth.ISSUER, "aud": "issued-offline-client", "sub": "offline-subject",
@@ -199,11 +218,25 @@ def test_refresh_id_token_is_optional_and_nonce_is_not_required(grant, sign, mon
     assert "nonce" not in siwc_auth.verify_id_token(refreshed.id_token, "issued-offline-client")
 
 
+def test_refresh_rotates_fresh_tokens_with_small_clock_skew(grant, sign, monkeypatch):
+    token = sign(iat=int(time.time()) + 10, nonce=None)
+    monkeypatch.setattr(siwc_auth, "_post_refresh", lambda fields: {
+        "access_token": "next-access", "refresh_token": "next-refresh", "expires_in": 3600,
+        "id_token": token})
+    refreshed = auth.refresh_after_unauthorized(auth.load_token_data(grant), expected_profile="siwc")
+    assert refreshed.access_token == "next-access" and refreshed.refresh_token == "next-refresh"
+    stored = json.loads(grant.read_text())
+    assert stored["tokens"]["id_token"] == token
+    assert stored["grant"]["id_token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
+    assert "refresh_error" not in stored
+
+
 @pytest.mark.parametrize("change", [
     {"scope": "openid profile"}, {"expires_in": 0}, {"token_type": "Basic"},
     {"refresh_token": ""}, {"access_token": "unsafe\nheader"},
     {"id_claims": {"sub": "different-subject"}}, {"id_claims": {"nonce": "different-nonce"}},
     {"id_claims": {"aud": "other-client"}}, {"id_claims": {"exp": 1}},
+    {"id_claims": {"iat": int(time.time()) + 3600}},
 ])
 def test_invalid_refresh_never_partially_replaces_tokens(grant, sign, monkeypatch, change):
     original = json.loads(grant.read_text())

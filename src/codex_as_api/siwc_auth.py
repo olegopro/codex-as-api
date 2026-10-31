@@ -36,6 +36,7 @@ AGENT_NAME = "codex-as-api-siwc"
 DIRECT_SCOPE = "chatgpt.tokens.use.direct"
 SCOPES = "openid profile email offline_access resource.invoke " + DIRECT_SCOPE
 DEFAULT_AUTH_PATH = "~/.codex-as-api-siwc/credentials.json"
+CLOCK_SKEW_SECONDS = 30
 _JWKS_CLIENT = jwt.PyJWKClient(JWKS_URL, timeout=15, cache_jwk_set=True, lifespan=300)
 
 
@@ -203,6 +204,7 @@ def verify_id_token(
             raise jwt.InvalidAlgorithmError()
         key = _JWKS_CLIENT.get_signing_key_from_jwt(token)
         claims = jwt.decode(token, key.key, algorithms=["RS256"], issuer=ISSUER, audience=client_id,
+            leeway=CLOCK_SKEW_SECONDS,
             options={"require": ["iss", "aud", "exp", "iat", "sub"], "verify_exp": not allow_expired})
         verified_sub = _text(claims.get("sub"), "ID token subject")
         _timestamp(claims["exp"], "ID token expiry")
