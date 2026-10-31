@@ -66,8 +66,9 @@ GET каталога; при необходимости обновляет grant
 - Каталог аккаунта: Bearer GET `https://api.openai.com/v1/models`.
 - Генерация: POST `/v1/responses`, `store:false`, `stream:true`, полный `input`.
 - Инструкции передаются как `instructions`/developer, не system-role input items.
-- Function/custom tools приводятся к разрешённому preview формату; вызовы и результаты
-  сохраняют имена и call IDs на стороне Anthropic-клиента.
+- Function/custom tools приводятся к разрешённому preview формату; namespace содержит
+  обязательный непустой `description`. Вызовы и результаты сохраняют имена и call IDs
+  на стороне Anthropic-клиента.
 - Успех требует `response.completed`: EOF, failed/incomplete и потоковая ошибка не
   означают успешного завершения и не завершают недописанный tool-call.
 - Запрещённые preview-параметры не отправляются, включая `max_output_tokens`,

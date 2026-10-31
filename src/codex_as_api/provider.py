@@ -1932,7 +1932,8 @@ def _prepare_siwc_tools(payload: dict[str, Any]) -> dict[str, str]:
     elif choice not in {"auto", "none", "required"}:
         raise ChatGPTOAuthInvalidRequestError("Недопустимый выбор инструмента SIWC")
     payload["tools"] = hosted + ([{
-        "type": "namespace", "name": SIWC_TOOL_NAMESPACE, "tools": functions,
+        "type": "namespace", "name": SIWC_TOOL_NAMESPACE,
+        "description": "Инструменты локального клиента.", "tools": functions,
     }] if functions else [])
     for item in payload["input"]:
         if item.get("type") == "function_call" and item.get("namespace") != SIWC_TOOL_NAMESPACE:

@@ -293,6 +293,8 @@ def test_siwc_namespace_function_and_encrypted_reasoning_roundtrip(siwc_provider
     assert response.tool_calls[0].id == "call_fixture"
     first_payload = json.loads(requests[-1].content)
     assert first_payload["tools"][0]["type"] == "namespace"
+    assert isinstance(first_payload["tools"][0]["description"], str)
+    assert first_payload["tools"][0]["description"].strip()
     assert first_payload["tools"][0]["tools"][0]["name"] == wire_name
     converted = internal_response_to_anthropic(
         response, "claude-synthetic", "msg_fixture", backend_model="synthetic-first",
