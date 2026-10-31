@@ -1641,13 +1641,16 @@ class ChatGPTOAuthProvider:
         if max_tokens is not None:
             raise ChatGPTOAuthInvalidRequestError("max_tokens is not supported by the ChatGPT Codex OAuth transport")
         _reject_unsupported_stop(stop)
-        instructions, input_items = _split_instructions_and_input(messages)
+        instructions, input_items = _split_instructions_and_input(
+            messages, preserve_system_positions=self.backend == "siwc",
+        )
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
         if any(msg.reasoning_items for msg in messages):
             instructions, input_items = _split_instructions_and_input(
                 messages,
                 backend_model=request_model,
+                preserve_system_positions=self.backend == "siwc",
             )
         if previous_response_id is not None:
             validated_previous_response_id = _validate_previous_response_id(previous_response_id)
@@ -2635,6 +2638,7 @@ def _split_instructions_and_input(
     messages: Sequence[Message],
     *,
     backend_model: str | None = None,
+    preserve_system_positions: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_messages: list[Message] = []
@@ -2644,7 +2648,12 @@ def _split_instructions_and_input(
                 part.get("prompt_cache_breakpoint") is not None for part in msg.content_parts
             ):
                 _reject_prompt_cache_breakpoint(None)
-            instructions.append(msg.content)
+            if preserve_system_positions and input_messages:
+                # Claude Code adds live token-budget notes after tool results.
+                # Hoisting them into instructions changes the entire cached prefix.
+                input_messages.append(replace(msg, role=MessageRole.DEVELOPER))
+            else:
+                instructions.append(msg.content)
         else:
             input_messages.append(msg)
     return "\n\n".join(instructions), _messages_to_response_items(

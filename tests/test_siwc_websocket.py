@@ -15,6 +15,7 @@ from websockets.protocol import State
 from codex_as_api import provider as provider_module
 from codex_as_api import siwc_transport
 from codex_as_api.auth import ChatGPTOAuthProtocolError, ChatGPTOAuthUpstreamError
+from codex_as_api.messages import Message, MessageRole
 from codex_as_api.provider import ChatGPTOAuthProvider
 from codex_as_api.siwc_transport import SIWCWebSocketPool
 
@@ -107,6 +108,30 @@ def test_siwc_websocket_sessions_do_not_share_a_channel(websocket_provider):
         provider.chat(test_siwc_provider._messages(), prompt_cache_key=key)
     assert len(calls) == 2
     assert [len(sock.sent) for sock in sockets] == [2, 1]
+
+
+def test_claude_code_late_system_notes_keep_the_same_channel_and_history_prefix(websocket_provider):
+    provider, sockets, calls, _ = websocket_provider()
+    first = [
+        Message(role=MessageRole.SYSTEM, content="Stable system prompt"),
+        Message(role=MessageRole.USER, content="Read the fixture"),
+        Message(role=MessageRole.SYSTEM, content="Environment and initial budget"),
+    ]
+    second = [*first,
+        Message(role=MessageRole.ASSISTANT, content="Earlier answer"),
+        Message(role=MessageRole.USER, content="Tool result"),
+        Message(role=MessageRole.SYSTEM, content="<total_tokens>14999985 tokens left</total_tokens>"),
+    ]
+    for messages in (first, second):
+        provider.chat(messages, prompt_cache_key="same-claude-session")
+    assert len(calls) == 1
+    initial, continued = sockets[0].sent
+    assert initial["instructions"] == continued["instructions"] == "Stable system prompt"
+    assert continued["input"][:len(initial["input"])] == initial["input"]
+    assert initial["input"][1]["role"] == "developer"
+    assert initial["input"][1]["content"][0]["text"] == first[2].content
+    assert continued["input"][-1]["role"] == "developer"
+    assert continued["input"][-1]["content"][0]["text"] == second[-1].content
 
 
 def test_background_model_does_not_replace_the_main_models_channel(websocket_provider):
