@@ -224,12 +224,15 @@ def _get_provider() -> ChatGPTOAuthProvider:
 async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> AsyncIterator[str]:
     """Keep the client alive without timing out or restarting the upstream iterator."""
     send, receive = anyio.create_memory_object_stream[str](1)
+    last_sent = anyio.current_time()
 
     async def pump() -> None:
+        nonlocal last_sent
         try:
             async with send:
                 async for chunk in iterate_in_threadpool(chunks):
                     await send.send(chunk)
+                    last_sent = anyio.current_time()
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             return
         finally:
@@ -237,22 +240,31 @@ async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> 
             if close is not None:
                 close()
 
+    async def ping_when_idle() -> None:
+        nonlocal last_sent
+        try:
+            while True:
+                remaining = ANTHROPIC_HEARTBEAT_SECONDS - (anyio.current_time() - last_sent)
+                await anyio.sleep(max(0, remaining))
+                if anyio.current_time() - last_sent >= ANTHROPIC_HEARTBEAT_SECONDS:
+                    await send.send('event: ping\ndata: {"type":"ping"}\n\n')
+                    last_sent = anyio.current_time()
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            return
+
     async with anyio.create_task_group() as tasks:
         tasks.start_soon(pump)
+        tasks.start_soon(ping_when_idle)
         finished = False
         try:
             async with receive:
                 while True:
-                    with anyio.move_on_after(ANTHROPIC_HEARTBEAT_SECONDS) as idle:
-                        try:
-                            chunk = await receive.receive()
-                        except anyio.EndOfStream:
-                            finished = True
-                            return
-                    if idle.cancel_called:
-                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
-                    else:
-                        yield chunk
+                    try:
+                        chunk = await receive.receive()
+                    except anyio.EndOfStream:
+                        finished = True
+                        return
+                    yield chunk
         except GeneratorExit:
             return
         finally:
