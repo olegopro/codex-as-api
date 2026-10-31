@@ -107,6 +107,7 @@ def test_siwc_health_reports_installed_vcs_revision(siwc_client, monkeypatch):
     monkeypatch.setattr(server, "distribution", lambda _name: SimpleNamespace(
         read_text=lambda filename: json.dumps(document) if filename == "direct_url.json" else None,
     ))
+    monkeypatch.setattr(server, "_RUNNING_PACKAGE_REVISION", server._package_revision())
     monkeypatch.setenv("CODEX_AS_API_PACKAGE_REVISION", "не-должно-использоваться")
     response = client.get("/health")
     assert response.status_code == 200
@@ -120,6 +121,13 @@ def test_siwc_health_reports_installed_vcs_revision(siwc_client, monkeypatch):
     assert "catalog_fetched_at" in body and "catalog_expires_at" in body
     assert "context_window" in body and "auto_compact_token_limit" in body
     assert "url" not in body and "auth_path" not in body
+
+
+def test_siwc_health_does_not_claim_an_update_before_process_restart(siwc_client, monkeypatch):
+    client, _, _ = siwc_client
+    monkeypatch.setattr(server, "_RUNNING_PACKAGE_REVISION", "a" * 40)
+    monkeypatch.setattr(server, "_package_revision", lambda: "b" * 40)
+    assert client.get("/health").json()["package_revision"] == "a" * 40
 
 
 @pytest.mark.parametrize("direct_url", [

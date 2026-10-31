@@ -1816,6 +1816,10 @@ def _package_revision() -> str | None:
     return commit
 
 
+# Package files can be updated while this process drains existing sessions.
+_RUNNING_PACKAGE_REVISION = _package_revision()
+
+
 def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
     if getattr(provider, "backend", BACKEND) != "siwc":
         return {}
@@ -1823,7 +1827,7 @@ def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
         "backend": "siwc",
         "upstream_base_url": SIWC_BASE_URL,
         "upstream_transport": provider.siwc_transport,
-        "package_revision": _package_revision(),
+        "package_revision": _RUNNING_PACKAGE_REVISION,
         "upstream_active_requests": (provider._siwc_websockets.active_requests
                                      if provider._siwc_websockets is not None else 0),
     }
