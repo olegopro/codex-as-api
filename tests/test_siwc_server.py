@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +15,7 @@ from codex_as_api.codex_config import CodexConfig
 from codex_as_api.provider import SIWC_BASE_URL
 from codex_as_api.siwc_transport import SIWCWebSocketPool
 
-from . import test_siwc_provider
+from . import test_siwc_provider, test_siwc_websocket
 
 siwc_provider = test_siwc_provider.siwc_provider
 
@@ -91,6 +93,43 @@ def _body(*, stream: bool = False) -> dict:
     }
 
 
+def test_one_hundred_http_streams_leave_workers_for_health_and_overflow(siwc_client, monkeypatch):
+    _, provider, _ = siwc_client
+    pool = SIWCWebSocketPool()
+    monkeypatch.setattr(provider, "_siwc_websockets", pool)
+    monkeypatch.setattr(provider, "siwc_transport", "websocket")
+    all_active = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    class WaitingSocket(test_siwc_websocket.FakeSocket):
+        def recv(self, *, timeout):
+            observed.append(pool.active_requests)
+            if pool.active_requests == pool.max_connections:
+                all_active.set()
+            assert release.wait(timeout=10)
+            return super().recv(timeout=timeout)
+
+    monkeypatch.setattr(test_siwc_websocket.siwc_transport, "connect", lambda *_args, **_kwargs:
+                        WaitingSocket([test_siwc_provider._completed()]))
+    with TestClient(server.app) as client, ThreadPoolExecutor(max_workers=100) as workers:
+        futures = [workers.submit(client.post, "/v1/messages", json=_body(stream=True)) for _ in range(100)]
+        try:
+            ready = all_active.wait(timeout=5)
+            if ready:
+                health = client.get("/health").json()
+                assert health["upstream_active_requests"] == 100
+                assert health["upstream_max_connections"] == 100
+                overflow = client.post("/v1/messages", json=_body(stream=True))
+                assert "event: error" in overflow.text
+                assert '"rate_limit_error"' in overflow.text
+        finally:
+            release.set()
+        responses = [future.result(timeout=10) for future in futures]
+        assert ready, f"Only {max(observed, default=0)} upstream receivers ran concurrently"
+        assert all(response.status_code == 200 and "event: message_stop" in response.text for response in responses)
+
+
 def test_siwc_image_generation_is_rejected_before_upstream(siwc_client):
     client, _, requests = siwc_client
     response = client.post("/v1/images/generations", json={"model": "gpt-6.1-sol", "prompt": "test"})
@@ -124,7 +163,7 @@ def test_siwc_health_reports_installed_vcs_revision(siwc_client, monkeypatch):
     assert "url" not in body and "auth_path" not in body
 
 
-@pytest.mark.parametrize("limit", [None, 7, 32])
+@pytest.mark.parametrize("limit", [None, 7, 32, 100])
 def test_siwc_health_reports_the_running_pool_capacity(siwc_client, monkeypatch, limit):
     client, provider, _ = siwc_client
     pool = SIWCWebSocketPool(limit=limit) if limit is not None else None

@@ -166,12 +166,12 @@ def test_sibling_histories_keep_separate_warm_channels(monkeypatch):
 
 
 @pytest.mark.parametrize("identical_prompts", [False, True])
-@pytest.mark.parametrize("concurrency", [2, 20, 32])
+@pytest.mark.parametrize("concurrency", [2, 20, 32, 100])
 def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts, concurrency):
     sockets = []
     observed_active = []
     pool = SIWCWebSocketPool()
-    assert pool.max_connections == 32
+    assert pool.max_connections == 100
 
     def at_peak():
         observed_active.append(pool.active_requests)

@@ -65,7 +65,7 @@ class _Connection:
 class SIWCWebSocketPool:
     """Warm channels per account/session/model/branch, with bounded concurrent leases."""
 
-    def __init__(self, *, limit: int = 32, idle_timeout: float = 1800.0) -> None:
+    def __init__(self, *, limit: int = 100, idle_timeout: float = 1800.0) -> None:
         self._limit = limit
         self._idle_timeout = idle_timeout
         self._lock = threading.Lock()

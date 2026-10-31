@@ -104,6 +104,7 @@ MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model)
 AUTH_PATH = _env_str("CODEX_AS_API_SIWC_AUTH_PATH" if BACKEND == "siwc" else "CODEX_AS_API_AUTH_PATH", None)
 CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
 ANTHROPIC_HEARTBEAT_SECONDS = 10.0
+SIWC_THREADPOOL_HEADROOM = 8
 _CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
 _ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
 _ANTHROPIC_MESSAGES_FIELDS = frozenset(
@@ -685,6 +686,19 @@ def _get_login_manager() -> DeviceLoginManager:
     if _login_manager is None:
         _login_manager = DeviceLoginManager(_commit_device_login)
     return _login_manager
+
+
+@app.on_event("startup")
+async def _configure_siwc_thread_capacity() -> None:
+    if BACKEND != "siwc":
+        return
+    pool = _get_provider()._siwc_websockets
+    if pool is not None:
+        # Blocked stream receivers must leave workers for catalog/preflight/health.
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = max(limiter.total_tokens, pool.max_connections + SIWC_THREADPOOL_HEADROOM)
+        logging.getLogger(__name__).info("SIWC concurrency channels=%s worker_threads=%s",
+                                         pool.max_connections, limiter.total_tokens)
 
 
 @app.on_event("shutdown")
