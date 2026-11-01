@@ -36,6 +36,7 @@ def anthropic_request_to_internal(
     output_config: object = None,
     metadata: object = None,
     backend_model: str | None = None,
+    structured_tool_results: bool = False,
 ) -> tuple[
     list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
 ]:
@@ -79,7 +80,7 @@ def anthropic_request_to_internal(
             if sys_text:
                 internal_messages.append(Message(role=MessageRole.SYSTEM, content=sys_text))
         elif role == "user":
-            _convert_user_message(content, internal_messages)
+            _convert_user_message(content, internal_messages, structured_tool_results=structured_tool_results)
         elif role == "assistant":
             _convert_assistant_message(content, internal_messages, backend_model=backend_model)
         else:
@@ -115,7 +116,7 @@ def _extract_system_text(system: str | list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-def _convert_user_message(content: object, out: list[Message]) -> None:
+def _convert_user_message(content: object, out: list[Message], *, structured_tool_results: bool = False) -> None:
     if isinstance(content, str):
         out.append(Message(role=MessageRole.USER, content=content))
         return
@@ -169,6 +170,7 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
                 raise ValueError(f"Anthropic tool_result block {index} requires string tool_use_id")
             result_content = block.get("content", "")
             tool_result_images: list[str] = []
+            tool_result_parts: list[dict[str, object]] = []
             if isinstance(result_content, list):
                 text_pieces: list[str] = []
                 for part_index, p in enumerate(result_content):
@@ -189,6 +191,7 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
                         if not isinstance(text, str):
                             raise ValueError(f"Anthropic tool_result block {index} text content requires string text")
                         text_pieces.append(text)
+                        tool_result_parts.append({"type": "input_text", "text": text})
                     elif p.get("type") == "image":
                         _reject_unknown_fields(
                             p,
@@ -198,8 +201,11 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
                         source = p.get("source")
                         image_url = _anthropic_image_url(source)
                         tool_result_images.append(image_url)
+                        tool_result_parts.append({"type": "input_image", "image_url": image_url})
                     else:
-                        text_pieces.append(_render_anthropic_content_block(p))
+                        text = _render_anthropic_content_block(p)
+                        text_pieces.append(text)
+                        tool_result_parts.append({"type": "input_text", "text": text})
                 result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
                 raise ValueError(f"Anthropic tool_result block {index} content must be a string or array")
@@ -207,14 +213,18 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
                 raise ValueError(f"Anthropic tool_result block {index} is_error must be a boolean")
             if block.get("is_error") is True:
                 result_content = f"[tool_error]\n{result_content}"
+                tool_result_parts.insert(0, {"type": "input_text", "text": "[tool_error]\n"})
+            structured = structured_tool_results and bool(tool_result_images)
             out.append(
                 Message(
                     role=MessageRole.TOOL,
                     content=result_content,
                     tool_call_id=tool_use_id,
+                    images=tuple(tool_result_images) if structured else (),
+                    content_parts=tuple(tool_result_parts) if structured else None,
                 )
             )
-            if tool_result_images:
+            if tool_result_images and not structured:
                 out.append(
                     Message(
                         role=MessageRole.USER,

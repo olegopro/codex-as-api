@@ -39,6 +39,42 @@ from codex_as_api.reasoning_signature import (
 
 
 class TestAnthropicRequestToInternal:
+    @pytest.mark.parametrize("is_error", [False, True])
+    @pytest.mark.parametrize("source", [
+        {"type": "url", "url": "https://example.com/tool.png"},
+        {"type": "base64", "media_type": "image/png", "data": "synthetic"},
+    ])
+    def test_structured_tool_result_keeps_order_and_call_id(self, source, is_error):
+        messages, *_ = anthropic_request_to_internal(
+            model="test", structured_tool_results=True,
+            messages=[{"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call_image", "is_error": is_error,
+                "content": [{"type": "text", "text": "BEFORE"}, {"type": "image", "source": source},
+                            {"type": "text", "text": "AFTER"}],
+            }]}],
+        )
+        image = source.get("url") or f"data:{source['media_type']};base64,{source['data']}"
+        output = [{"type": "input_text", "text": "BEFORE"}, {"type": "input_image", "image_url": image},
+                  {"type": "input_text", "text": "AFTER"}]
+        if is_error:
+            output.insert(0, {"type": "input_text", "text": "[tool_error]\n"})
+        assert len(messages) == 1
+        assert messages[0].images == (image,)
+        assert _messages_to_response_items(messages) == [
+            {"type": "function_call_output", "call_id": "call_image", "output": output},
+        ]
+
+    def test_structured_plain_text_tool_result_keeps_existing_wire_shape(self):
+        messages, *_ = anthropic_request_to_internal(
+            model="test", structured_tool_results=True,
+            messages=[{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_text", "content": "plain"},
+            ]}],
+        )
+        assert _messages_to_response_items(messages) == [
+            {"type": "function_call_output", "call_id": "call_text", "output": "plain"},
+        ]
+
     @pytest.mark.parametrize("after_tool", [False, True])
     def test_text_image_order_survives_full_history_conversion(self, after_tool):
         content = [

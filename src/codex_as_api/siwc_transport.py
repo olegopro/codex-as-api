@@ -1,4 +1,4 @@
-"""Bounded session affinity for public SIWC WebSockets; every turn sends full input."""
+"""Сохраняемые SIWC WebSocket; полный input каждого хода, лимит только при явном выборе."""
 from __future__ import annotations
 
 import hashlib
@@ -110,9 +110,9 @@ class _Connection:
 
 
 class SIWCWebSocketPool:
-    """Warm channels per account/session/model/branch, with bounded concurrent leases."""
+    """Каналы по аккаунту/сессии/модели/ветке, без локального потолка по умолчанию."""
 
-    def __init__(self, *, limit: int = 100, idle_timeout: float = 1800.0) -> None:
+    def __init__(self, *, limit: int | None = None, idle_timeout: float = 1800.0) -> None:
         self._limit = limit
         self._idle_timeout = idle_timeout
         self._lock = threading.Lock()
@@ -120,7 +120,7 @@ class SIWCWebSocketPool:
         self._closed = False
 
     @property
-    def max_connections(self) -> int:
+    def max_connections(self) -> int | None:
         return self._limit
 
     @property
@@ -163,7 +163,7 @@ class SIWCWebSocketPool:
             best = max(candidates, key=lambda candidate: candidate[0], default=(-1, None))
             available = best[1] if best[0] >= 0 else None
             if available is None:
-                if len(self._connections) >= self._limit:
+                if self._limit is not None and len(self._connections) >= self._limit:
                     victim = next((k for k, v in self._connections.items() if v.users == 0), None)
                     if victim is None:
                         raise ChatGPTOAuthUpstreamError(429, "All SIWC session channels are busy")

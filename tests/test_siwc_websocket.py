@@ -299,12 +299,12 @@ def test_rewritten_output_does_not_reuse_an_incompatible_warm_channel(monkeypatc
 
 
 @pytest.mark.parametrize("identical_prompts", [False, True])
-@pytest.mark.parametrize("concurrency", [2, 20, 32, 100])
-def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts, concurrency):
+@pytest.mark.parametrize("limit,concurrency", [(100, 2), (100, 20), (100, 32), (100, 100), (None, 128)])
+def test_same_parent_model_requests_reach_upstream_concurrently(monkeypatch, identical_prompts, limit, concurrency):
     sockets = []
     observed_active = []
-    pool = SIWCWebSocketPool()
-    assert pool.max_connections == 100
+    pool = SIWCWebSocketPool() if limit is None else SIWCWebSocketPool(limit=limit)
+    assert pool.max_connections == limit
 
     def at_peak():
         observed_active.append(pool.active_requests)
@@ -396,6 +396,63 @@ def test_many_idle_channels_close_concurrently(monkeypatch, expire):
         assert all(socket.closed for socket in sockets[:8])
         assert pool.active_requests == 0
     finally:
+        pool.close()
+
+
+def test_expired_cleanup_delays_its_request_but_not_other_leases(monkeypatch):
+    sockets = []
+    closing, release = threading.Event(), threading.Event()
+    close_lock = threading.Lock()
+    active_closes = maximum_closes = 0
+
+    class ClosingSocket(FakeSocket):
+        def close(self):
+            nonlocal active_closes, maximum_closes
+            if not self.closed and self in sockets[:100]:
+                with close_lock:
+                    active_closes += 1
+                    maximum_closes = max(maximum_closes, active_closes)
+                    if active_closes == 8:
+                        closing.set()
+                try:
+                    assert release.wait(3), "test did not release idle cleanup"
+                finally:
+                    with close_lock:
+                        active_closes -= 1
+            super().close()
+
+    def connect(*_args, **_kwargs):
+        socket = ClosingSocket([{"type": "response.completed"}])
+        sockets.append(socket)
+        return socket
+
+    def events(session):
+        return list(pool.events({"prompt_cache_key": session}, account_id="account",
+                                access_token="synthetic", timeout=1))
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 100)
+    pool = SIWCWebSocketPool(idle_timeout=10)
+    try:
+        for index in range(100):
+            events(str(index))
+        monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 111)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            triggering_request = workers.submit(events, "trigger")
+            try:
+                assert closing.wait(1)
+                assert pool.active_requests == 1
+                assert workers.submit(events, "unrelated").result(timeout=1)
+                assert not triggering_request.done()
+                assert pool.active_requests == 1
+            finally:
+                release.set()
+            assert triggering_request.result(timeout=3)
+        assert maximum_closes == 8
+        assert all(socket.closed for socket in sockets[:100])
+        assert pool.active_requests == 0
+    finally:
+        release.set()
         pool.close()
 
 

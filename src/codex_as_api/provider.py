@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, NoReturn, cast
@@ -1235,21 +1235,6 @@ class ChatGPTOAuthProvider:
                             raise ChatGPTOAuthProtocolError("Завершённый output не совпадает с элементами потока")
                         final_output = deepcopy(completed_output)
                 display_output = deepcopy(final_output)
-                for item in display_output:
-                    tool = _tool_call_for_prepared_request(item, prepared, backend=self.backend)
-                    if tool is not None and tool.id not in yielded_tool_call_ids:
-                        yielded_tool_call_ids.add(tool.id)
-                        saw_function_tool_call = True
-                        yield {
-                            "type": "tool_call",
-                            "id": tool.id,
-                            "name": tool.name,
-                            "arguments": tool.arguments,
-                        }
-                    web_search = _web_search_event_from_response_item(item)
-                    if web_search is not None and str(web_search["id"]) not in yielded_web_search_ids:
-                        yielded_web_search_ids.add(str(web_search["id"]))
-                        yield web_search
                 final_text = _text_from_response_items(display_output)
                 if saw_text_delta and "".join(streamed_text_parts) != final_text:
                     raise ChatGPTOAuthProtocolError(
@@ -1275,6 +1260,21 @@ class ChatGPTOAuthProvider:
                     raise ChatGPTOAuthProtocolError(
                         "response.completed reasoning content does not match streamed reasoning content"
                     )
+                for item in display_output:
+                    tool = _tool_call_for_prepared_request(item, prepared, backend=self.backend)
+                    if tool is not None and tool.id not in yielded_tool_call_ids:
+                        yielded_tool_call_ids.add(tool.id)
+                        saw_function_tool_call = True
+                        yield {
+                            "type": "tool_call",
+                            "id": tool.id,
+                            "name": tool.name,
+                            "arguments": tool.arguments,
+                        }
+                    web_search = _web_search_event_from_response_item(item)
+                    if web_search is not None and str(web_search["id"]) not in yielded_web_search_ids:
+                        yielded_web_search_ids.add(str(web_search["id"]))
+                        yield web_search
                 self._response_chains.commit(
                     response["id"],
                     replay_input,
@@ -1797,6 +1797,9 @@ class ChatGPTOAuthProvider:
         extra_headers: dict[str, str] | None = None,
         catalog_key: CatalogKey | None = None,
     ) -> Iterator[dict[str, Any]]:
+        cancel = getattr(extra_headers, "cancel", None) if self.backend == "siwc" else None
+        if cancel is not None:
+            cancel.check()
         if self.backend == "siwc" and self.siwc_transport == "websocket":
             if path != "/responses":
                 raise ChatGPTOAuthInvalidRequestError("SIWC WebSocket supports only /responses")
@@ -1808,7 +1811,7 @@ class ChatGPTOAuthProvider:
                 try:
                     for event in self._siwc_websockets.events(
                         payload, account_id=token.account_id, access_token=token.access_token, timeout=self.timeout,
-                        cancel=getattr(extra_headers, "cancel", None),
+                        cancel=cancel,
                     ):
                         if event.get("type") in {"error", "response.failed", "response.incomplete"}:
                             event = _redact_failure_event(event, ws_token_values)
@@ -1850,7 +1853,9 @@ class ChatGPTOAuthProvider:
             )
             error_deadline = time.monotonic() + self.timeout
             try:
-                with self._open_request(req, timeout=self.timeout) as response:
+                with self._open_request(req, timeout=self.timeout) as response, (
+                    cancel.bind(response.close) if cancel is not None else nullcontext()
+                ):
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,
@@ -1862,6 +1867,8 @@ class ChatGPTOAuthProvider:
                     try:
                         while True:
                             raw_line = response.readline()
+                            if cancel is not None:
+                                cancel.check()
                             if raw_line == b"":
                                 if block:
                                     event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
@@ -2685,7 +2692,8 @@ def _messages_to_response_items(
                 {
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": message.content,
+                    "output": (_message_item("user", message.content, content_parts=message.content_parts)["content"]
+                               if message.content_parts is not None else message.content),
                 }
             )
             continue

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -223,7 +224,9 @@ def _get_provider() -> ChatGPTOAuthProvider:
     return _provider
 
 
-async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> AsyncIterator[str]:
+async def _anthropic_heartbeat(
+    chunks: Iterator[str], *, cancel: Any = None, ping: str = 'event: ping\ndata: {"type":"ping"}\n\n',
+) -> AsyncIterator[str]:
     """Keep the client alive without timing out or restarting the upstream iterator."""
     send, receive = anyio.create_memory_object_stream[str](1)
     last_sent = anyio.current_time()
@@ -249,7 +252,7 @@ async def _anthropic_heartbeat(chunks: Iterator[str], *, cancel: Any = None) -> 
                 remaining = ANTHROPIC_HEARTBEAT_SECONDS - (anyio.current_time() - last_sent)
                 await anyio.sleep(max(0, remaining))
                 if anyio.current_time() - last_sent >= ANTHROPIC_HEARTBEAT_SECONDS:
-                    await send.send('event: ping\ndata: {"type":"ping"}\n\n')
+                    await send.send(ping)
                     last_sent = anyio.current_time()
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             return
@@ -695,12 +698,13 @@ async def _configure_siwc_thread_capacity() -> None:
     if BACKEND != "siwc":
         return
     pool = _get_provider()._siwc_websockets
-    if pool is not None:
-        # Blocked stream receivers must leave workers for catalog/preflight/health.
-        limiter = anyio.to_thread.current_default_thread_limiter()
-        limiter.total_tokens = max(limiter.total_tokens, pool.max_connections + SIWC_THREADPOOL_HEADROOM)
-        logging.getLogger(__name__).info("SIWC concurrency channels=%s worker_threads=%s",
-                                         pool.max_connections, limiter.total_tokens)
+    limit = pool.max_connections if pool is not None else None
+    # Без потолка каналов общий limiter тоже не должен создавать скрытую очередь.
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    capacity = math.inf if limit is None else limit + SIWC_THREADPOOL_HEADROOM
+    limiter.total_tokens = max(limiter.total_tokens, capacity)
+    logging.getLogger(__name__).info("SIWC concurrency channels=%s worker_threads=%s",
+                                     "unlimited" if limit is None else limit, limiter.total_tokens)
 
 
 @app.on_event("shutdown")
@@ -2113,9 +2117,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             }
             yield f"data: {json.dumps(preamble)}\n\n"
 
-            reasoning_parts: list[str] = []
-            content_parts: list[str] = []
-            tool_calls_buffer: list[dict[str, Any]] = []
+            tool_index = 0
             usage_dict: dict[str, Any] | None = None
 
             def _provider_events() -> Iterator[dict[str, Any]]:
@@ -2167,7 +2169,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     return
                 if typ == "content":
                     text = cast(str, event["text"])
-                    content_parts.append(text)
                     chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -2184,7 +2185,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     yield f"data: {json.dumps(chunk)}\n\n"
                 elif typ == "reasoning_delta":
                     text = cast(str, event["text"])
-                    reasoning_parts.append(text)
                     # OpenAI-compatible reasoning field
                     chunk = {
                         "id": request_id,
@@ -2202,7 +2202,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     yield f"data: {json.dumps(chunk)}\n\n"
                 elif typ == "reasoning_raw_delta":
                     text = cast(str, event["text"])
-                    reasoning_parts.append(text)
                     chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -2218,7 +2217,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
                 elif typ == "tool_call":
-                    tool_index = len(tool_calls_buffer)
                     tc = {
                         "index": tool_index,
                         "id": event.get("id"),
@@ -2228,7 +2226,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                             "arguments": event["arguments"],
                         },
                     }
-                    tool_calls_buffer.append(tc)
+                    tool_index += 1
                     chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -2293,8 +2291,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 
             yield "data: [DONE]\n\n"
 
+        chunks = _stream()
         return StreamingResponse(
-            _stream(),
+            _anthropic_heartbeat(chunks, cancel=getattr(prepared_request, "cancel", None), ping=": ping\n\n")
+            if getattr(provider, "backend", BACKEND) == "siwc" else chunks,
             media_type="text/event-stream",
         )
 
@@ -2495,6 +2495,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
             output_format=_anthropic_output_format_from_body(body),
             output_config=body.get("output_config"),
             metadata=body.get("metadata"),
+            structured_tool_results=getattr(provider, "backend", BACKEND) == "siwc",
         )
         input_tokens = _estimate_input_tokens(messages, tools)
     except (ValueError, ChatGPTOAuthInvalidRequestError) as exc:
@@ -2597,6 +2598,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             output_format=_anthropic_output_format_from_body(body),
             output_config=body.get("output_config"),
             metadata=body.get("metadata"),
+            structured_tool_results=getattr(provider, "backend", BACKEND) == "siwc",
         )
         thinking_display, reasoning_summary, thinking_disabled = resolve_anthropic_thinking_options(
             cast(dict[str, Any] | None, raw_thinking),

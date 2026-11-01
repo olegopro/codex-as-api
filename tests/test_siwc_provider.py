@@ -163,6 +163,70 @@ def _messages() -> list[Message]:
     return [Message(role=MessageRole.SYSTEM, content="Правила"), Message(role=MessageRole.USER, content="Вопрос")]
 
 
+@pytest.mark.parametrize("cancel_before_open", [False, True])
+def test_siwc_http_cancellation_closes_its_stream(siwc_provider, cancel_before_open):
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class WaitingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            entered.set()
+            assert release.wait(2), "test did not release the HTTP stream"
+            yield _sse([_completed()])
+
+        def close(self):
+            closed.set()
+            release.set()
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=_catalog())
+        return httpx.Response(200, stream=WaitingStream())
+
+    provider, requests = siwc_provider(handler=respond)
+    prepared = provider.preflight_chat(_messages())
+    if cancel_before_open:
+        prepared.cancel.cancel()
+    results = []
+
+    def consume():
+        try:
+            provider.chat(_messages(), _prepared_request=prepared)
+        except (OSError, ChatGPTOAuthUpstreamError) as exc:
+            results.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    try:
+        if not cancel_before_open:
+            assert entered.wait(1)
+            prepared.cancel.cancel()
+            assert closed.wait(0.5), "cancellation did not close the HTTP response"
+    finally:
+        release.set()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert len(results) == 1
+    assert provider._active_responses == set()
+    if cancel_before_open:
+        assert [request.method for request in requests] == ["GET"]
+
+
+def test_siwc_invalid_completed_text_does_not_emit_a_tool_call(siwc_provider):
+    tool = {"type": "function_call", "name": "codex_as_api.read", "call_id": "call_read",
+            "arguments": '{}', "status": "completed"}
+    provider, _ = siwc_provider(events=[
+        {"type": "response.output_text.delta", "delta": "streamed text"},
+        {"type": "response.output_item.done", "item": _text_item("different final text")},
+        {"type": "response.output_item.done", "item": tool},
+        _completed([]),
+    ])
+    emitted = []
+    with pytest.raises(ChatGPTOAuthProtocolError, match="does not match streamed output text"):
+        for event in provider.chat_stream(_messages(), tools=[ToolSchema(name="read", description="", parameters={})]):
+            emitted.append(event)
+    assert not any(event["type"] in {"tool_call", "finish"} for event in emitted)
+
+
 def test_siwc_payload_catalog_headers_and_usage(siwc_provider, monkeypatch):
     monkeypatch.setenv("CODEX_AS_API_CODEX_CLI_VERSION", "не-используется")
     monkeypatch.setenv("CODEX_AS_API_RESPONSES_LITE", "on")

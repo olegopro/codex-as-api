@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from codex_as_api import server
 from codex_as_api.auth import ChatGPTOAuthMissingError, ChatGPTOAuthProtocolError
@@ -70,6 +73,24 @@ def test_siwc_server_upstream_timeout_exceeds_the_client_idle_watchdog(monkeypat
     assert arguments["timeout"] == 600.0
 
 
+@pytest.mark.parametrize("backend", ["siwc", "codex"])
+@pytest.mark.parametrize("transport,limit", [("websocket", None), ("websocket", 100), ("http", None)])
+def test_thread_capacity_matches_channels_without_affecting_legacy(monkeypatch, backend, transport, limit):
+    pool = SIWCWebSocketPool(limit=limit) if transport == "websocket" else None
+    monkeypatch.setattr(server, "BACKEND", backend)
+    monkeypatch.setattr(server, "_provider", SimpleNamespace(_siwc_websockets=pool))
+
+    async def exercise():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 40
+        await server._configure_siwc_thread_capacity()
+        expected = 40 if backend == "codex" else math.inf if limit is None else 108
+        assert limiter.total_tokens == expected
+        assert server._anthropic_cancel_limiter.total_tokens == 8
+
+    anyio.run(exercise)
+
+
 @pytest.fixture()
 def siwc_client(monkeypatch, siwc_provider):
     provider, requests = siwc_provider()
@@ -93,9 +114,37 @@ def _body(*, stream: bool = False) -> dict:
     }
 
 
-def test_one_hundred_http_streams_leave_workers_for_health_and_overflow(siwc_client, monkeypatch):
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_tool_image_reaches_siwc_as_ordered_function_output(siwc_client, stream):
+    client, _, requests = siwc_client
+    body = _body(stream=stream)
+    body["tools"] = [{"name": "inspect", "description": "Fixture", "input_schema": {
+        "type": "object", "properties": {}, "additionalProperties": False}}]
+    body["messages"] += [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_image",
+                                             "name": "inspect", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_image", "content": [
+            {"type": "text", "text": "BEFORE"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/tool.png"}},
+            {"type": "text", "text": "AFTER"},
+        ]}]},
+    ]
+    response = client.post("/v1/messages", json=body)
+    assert response.status_code == 200, response.text
+    payload = json.loads(requests[-1].content)
+    assert payload["input"][-1] == {
+        "type": "function_call_output", "call_id": "call_image", "output": [
+            {"type": "input_text", "text": "BEFORE"},
+            {"type": "input_image", "image_url": "https://example.com/tool.png"},
+            {"type": "input_text", "text": "AFTER"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("limit,concurrency", [(100, 100), (None, 128)])
+def test_http_stream_capacity_preserves_health_and_explicit_limits(siwc_client, monkeypatch, limit, concurrency):
     _, provider, _ = siwc_client
-    pool = SIWCWebSocketPool()
+    pool = SIWCWebSocketPool() if limit is None else SIWCWebSocketPool(limit=limit)
     monkeypatch.setattr(provider, "_siwc_websockets", pool)
     monkeypatch.setattr(provider, "siwc_transport", "websocket")
     all_active = threading.Event()
@@ -105,29 +154,95 @@ def test_one_hundred_http_streams_leave_workers_for_health_and_overflow(siwc_cli
     class WaitingSocket(test_siwc_websocket.FakeSocket):
         def recv(self, *, timeout):
             observed.append(pool.active_requests)
-            if pool.active_requests == pool.max_connections:
+            if pool.active_requests == concurrency:
                 all_active.set()
             assert release.wait(timeout=10)
             return super().recv(timeout=timeout)
 
     monkeypatch.setattr(test_siwc_websocket.siwc_transport, "connect", lambda *_args, **_kwargs:
                         WaitingSocket([test_siwc_provider._completed()]))
-    with TestClient(server.app) as client, ThreadPoolExecutor(max_workers=100) as workers:
-        futures = [workers.submit(client.post, "/v1/messages", json=_body(stream=True)) for _ in range(100)]
+    with TestClient(server.app) as client, ThreadPoolExecutor(max_workers=concurrency) as workers:
+        futures = [workers.submit(client.post, "/v1/messages", json=_body(stream=True)) for _ in range(concurrency)]
         try:
             ready = all_active.wait(timeout=5)
             if ready:
                 health = client.get("/health").json()
-                assert health["upstream_active_requests"] == 100
-                assert health["upstream_max_connections"] == 100
-                overflow = client.post("/v1/messages", json=_body(stream=True))
-                assert "event: error" in overflow.text
-                assert '"rate_limit_error"' in overflow.text
+                assert health["upstream_active_requests"] == concurrency
+                assert health["upstream_max_connections"] == limit
+                if limit is not None:
+                    overflow = client.post("/v1/messages", json=_body(stream=True))
+                    assert "event: error" in overflow.text
+                    assert '"rate_limit_error"' in overflow.text
         finally:
             release.set()
         responses = [future.result(timeout=10) for future in futures]
         assert ready, f"Only {max(observed, default=0)} upstream receivers ran concurrently"
         assert all(response.status_code == 200 and "event: message_stop" in response.text for response in responses)
+
+
+@pytest.mark.parametrize("facade", ["anthropic", "openai"])
+@pytest.mark.parametrize("limit", [None, 1])
+def test_siwc_stream_disconnect_releases_its_websocket(siwc_client, monkeypatch, facade, limit):
+    _, provider, _ = siwc_client
+    pool = SIWCWebSocketPool(limit=limit)
+    release = threading.Event()
+    monkeypatch.setattr(provider, "_siwc_websockets", pool)
+    monkeypatch.setattr(provider, "siwc_transport", "websocket")
+
+    async def exercise():
+        entered, finished = anyio.Event(), anyio.Event()
+        scopes = []
+
+        class WaitingSocket(test_siwc_websocket.FakeSocket):
+            def recv(self, *, timeout):
+                anyio.from_thread.run_sync(entered.set)
+                assert release.wait(2), "disconnect did not release the upstream receiver"
+                return super().recv(timeout=timeout)
+
+            def close(self):
+                super().close()
+                release.set()
+
+        monkeypatch.setattr(test_siwc_websocket.siwc_transport, "connect", lambda *_args, **_kwargs:
+                            WaitingSocket([test_siwc_provider._completed()]))
+        body = _body(stream=True) if facade == "anthropic" else {
+            "model": "synthetic-first", "messages": [{"role": "user", "content": "Question"}], "stream": True,
+        }
+        request = Request({"type": "http", "headers": []})
+        if facade == "anthropic":
+            async def receive():
+                return {"type": "http.request", "body": json.dumps(body).encode()}
+
+            request = Request({"type": "http", "headers": []}, receive=receive)
+            response = await server.anthropic_messages(request)
+        else:
+            response = await server.chat_completions(server.ChatCompletionRequest(**body), request)
+
+        async def consume():
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                async for _chunk in response.body_iterator:
+                    pass
+            finished.set()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(consume)
+                with anyio.fail_after(1):
+                    await entered.wait()
+                assert pool.active_requests == 1
+                scopes[0].cancel()
+                try:
+                    with anyio.fail_after(0.5):
+                        await finished.wait()
+                    assert pool.active_requests == 0
+                finally:
+                    release.set()
+        finally:
+            release.set()
+            pool.close()
+
+    anyio.run(exercise)
 
 
 def test_siwc_image_generation_is_rejected_before_upstream(siwc_client):
