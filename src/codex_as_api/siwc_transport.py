@@ -11,9 +11,8 @@ import threading
 import time
 import urllib.error
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -117,6 +116,8 @@ class SIWCWebSocketPool:
         self._idle_timeout = idle_timeout
         self._lock = threading.Lock()
         self._connections: OrderedDict[tuple[str, str, str, str, int], _Connection] = OrderedDict()
+        self._retired: deque[_Connection] = deque()
+        self._closers: set[threading.Thread] = set()
         self._closed = False
 
     @property
@@ -181,7 +182,7 @@ class SIWCWebSocketPool:
             entry.history = history
             entry.output_key = None
             self._connections.move_to_end(available)
-        _close_connections(expired)
+            self._retire_locked(expired)
         return entry
 
     def events(
@@ -310,19 +311,31 @@ class SIWCWebSocketPool:
                 entry.users -= 1
                 entry.last_used = time.monotonic()
 
+    def _retire_locked(self, entries: list[_Connection]) -> None:
+        self._retired.extend(entries)
+        for _ in range(min(8 - len(self._closers), len(self._retired))):
+            worker = threading.Thread(target=self._drain_retired, name="siwc-close", daemon=False)
+            self._closers.add(worker)
+            worker.start()
+
+    def _drain_retired(self) -> None:
+        while True:
+            with self._lock:
+                if not self._retired:
+                    self._closers.remove(threading.current_thread())
+                    return
+                entry = self._retired.popleft()
+            try:
+                entry.close()
+            except Exception:
+                _LOG.warning("SIWC WebSocket cleanup failed", exc_info=True)
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            entries = list(self._connections.values())
+            self._retire_locked(list(self._connections.values()))
             self._connections.clear()
-        _close_connections(entries)
-
-
-def _close_connections(entries: list[_Connection]) -> None:
-    if len(entries) < 2:
-        for entry in entries:
-            entry.close()
-        return
-    # Bound cleanup time without keeping another thread pool alive between calls.
-    with ThreadPoolExecutor(max_workers=min(8, len(entries))) as workers:
-        list(workers.map(lambda entry: entry.close(), entries))
+            workers = list(self._closers)
+        # Запрос не ждёт idle-close; явная остановка дожидается всей очереди.
+        for worker in workers:
+            worker.join()

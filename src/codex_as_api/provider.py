@@ -9,6 +9,7 @@ import os
 import pathlib
 import platform
 import re
+import socket
 import threading
 import time
 import unicodedata
@@ -17,7 +18,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, NoReturn, cast
@@ -620,7 +621,9 @@ class ChatGPTOAuthProvider:
         return refreshed
 
     @contextmanager
-    def _open_request(self, request: urllib.request.Request, *, timeout: float) -> Iterator[Any]:
+    def _open_request(
+        self, request: urllib.request.Request, *, timeout: float, cancel: _RequestCancellation | None = None,
+    ) -> Iterator[Any]:
         if self.backend != "siwc":
             with _urlopen_no_redirect(request, timeout=timeout) as response:
                 yield response
@@ -635,22 +638,50 @@ class ChatGPTOAuthProvider:
         # Honor the configured HTTPS proxy just as OAuth refresh and legacy do.
         client = self._http_client or httpx.Client(trust_env=True)
         response = None
+        network_stream: Any = None
+
+        def stop() -> None:
+            if network_stream is not None:
+                raw_socket = network_stream.get_extra_info("socket")
+                if raw_socket is not None:
+                    # close() не прерывает recv другого потока без shutdown().
+                    with suppress(OSError):
+                        raw_socket.shutdown(socket.SHUT_RDWR)
+                network_stream.close()
+            if response is not None:
+                response.close()
+
+        def trace(name: str, info: dict[str, Any]) -> None:
+            nonlocal network_stream
+            if name.endswith(("connect_tcp.complete", "start_tls.complete")):
+                network_stream = info["return_value"]
+            if cancel is not None:
+                try:
+                    cancel.check()
+                except OSError:
+                    stop()
+                    raise
+
         try:
             public_request = httpx.Request(
                 request.get_method(), request.full_url,
                 headers=dict(request.header_items()), content=content,
-                extensions={"timeout": dict.fromkeys(("connect", "read", "write", "pool"), timeout)},
+                extensions={"timeout": dict.fromkeys(("connect", "read", "write", "pool"), timeout),
+                            **({"trace": trace} if cancel is not None else {})},
             )
-            response = client.send(public_request, stream=True, auth=None, follow_redirects=False)
-            if response.status_code >= 300:
-                error_headers = http.client.HTTPMessage()
-                for key, value in response.headers.items():
-                    error_headers[key] = value
-                raise urllib.error.HTTPError(
-                    request.full_url, response.status_code, "Ошибка публичного API",
-                    error_headers, io.BytesIO(response.read()),
-                )
-            yield _HTTPXResponse(response)
+            with cancel.bind(stop) if cancel is not None else nullcontext():
+                response = client.send(public_request, stream=True, auth=None, follow_redirects=False)
+                if cancel is not None:
+                    cancel.check()
+                if response.status_code >= 300:
+                    error_headers = http.client.HTTPMessage()
+                    for key, value in response.headers.items():
+                        error_headers[key] = value
+                    raise urllib.error.HTTPError(
+                        request.full_url, response.status_code, "Ошибка публичного API",
+                        error_headers, io.BytesIO(response.read()),
+                    )
+                yield _HTTPXResponse(response)
         except httpx.HTTPError as exc:
             raise OSError(str(exc)) from exc
         finally:
@@ -1853,9 +1884,7 @@ class ChatGPTOAuthProvider:
             )
             error_deadline = time.monotonic() + self.timeout
             try:
-                with self._open_request(req, timeout=self.timeout) as response, (
-                    cancel.bind(response.close) if cancel is not None else nullcontext()
-                ):
+                with self._open_request(req, timeout=self.timeout, cancel=cancel) as response:
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,

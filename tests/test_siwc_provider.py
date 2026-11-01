@@ -211,6 +211,79 @@ def test_siwc_http_cancellation_closes_its_stream(siwc_provider, cancel_before_o
         assert [request.method for request in requests] == ["GET"]
 
 
+def test_siwc_http_cancellation_before_response_headers(monkeypatch):
+    waiting, disconnected = threading.Event(), threading.Event()
+    requests, results = [], []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(_catalog()).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            requests.append(self.rfile.read(int(self.headers["Content-Length"])))
+            waiting.set()
+            self.connection.settimeout(2)
+            try:
+                if self.connection.recv(1) == b"":
+                    disconnected.set()
+                    return
+            except TimeoutError:
+                pass
+            body = _sse([_completed()])
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    listener = threading.Thread(target=server.serve_forever)
+    listener.start()
+
+    class LocalTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            local = httpx.Request(
+                request.method, f"http://127.0.0.1:{server.server_port}{request.url.path}",
+                headers=request.headers, content=request.content, extensions=request.extensions,
+            )
+            return super().handle_request(local)
+
+    monkeypatch.setattr(provider_module, "token_for_request", lambda *_args, **_kwargs: _token())
+    with httpx.Client(transport=LocalTransport(), trust_env=False) as client:
+        provider = ChatGPTOAuthProvider(backend="siwc", http_client=client, siwc_transport="http", timeout=3)
+        prepared = provider.preflight_chat(_messages())
+
+        def consume():
+            try:
+                provider.chat(_messages(), _prepared_request=prepared)
+            except (OSError, ChatGPTOAuthUpstreamError) as exc:
+                results.append(exc)
+
+        worker = threading.Thread(target=consume)
+        try:
+            worker.start()
+            assert waiting.wait(1), "POST не достиг ожидания заголовков"
+            prepared.cancel.cancel()
+            worker.join(timeout=0.5)
+            assert not worker.is_alive(), "Отмена оставила HTTP worker до получения заголовков"
+            assert disconnected.wait(0.5), "Отмена не закрыла ожидающий upstream-сокет"
+            assert len(results) == 1 and len(requests) == 1
+            assert provider._active_responses == set()
+        finally:
+            worker.join(timeout=4)
+            provider.close()
+            server.shutdown()
+            server.server_close()
+            listener.join(timeout=2)
+    assert not worker.is_alive() and not listener.is_alive()
+
+
 def test_siwc_invalid_completed_text_does_not_emit_a_tool_call(siwc_provider):
     tool = {"type": "function_call", "name": "codex_as_api.read", "call_id": "call_read",
             "arguments": '{}', "status": "completed"}

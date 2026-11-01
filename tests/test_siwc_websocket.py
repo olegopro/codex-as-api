@@ -391,15 +391,14 @@ def test_many_idle_channels_close_concurrently(monkeypatch, expire):
             monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 111)
             list(pool.events({"prompt_cache_key": "new"}, account_id="account",
                              access_token="synthetic", timeout=1))
-        else:
-            pool.close()
+        pool.close()
         assert all(socket.closed for socket in sockets[:8])
         assert pool.active_requests == 0
     finally:
         pool.close()
 
 
-def test_expired_cleanup_delays_its_request_but_not_other_leases(monkeypatch):
+def test_expired_cleanup_does_not_delay_its_request_or_other_leases(monkeypatch):
     sockets = []
     closing, release = threading.Event(), threading.Event()
     close_lock = threading.Lock()
@@ -441,18 +440,98 @@ def test_expired_cleanup_delays_its_request_but_not_other_leases(monkeypatch):
             triggering_request = workers.submit(events, "trigger")
             try:
                 assert closing.wait(1)
-                assert pool.active_requests == 1
-                assert workers.submit(events, "unrelated").result(timeout=1)
-                assert not triggering_request.done()
-                assert pool.active_requests == 1
+                assert triggering_request.result(timeout=0.5)
+                assert workers.submit(events, "unrelated").result(timeout=0.5)
+                assert pool.active_requests == 0
+                assert not any(socket.closed for socket in sockets[:100])
             finally:
                 release.set()
-            assert triggering_request.result(timeout=3)
+        pool.close()
         assert maximum_closes == 8
         assert all(socket.closed for socket in sockets[:100])
         assert pool.active_requests == 0
     finally:
         release.set()
+        pool.close()
+
+
+def test_overlapping_cleanup_is_bounded_joined_and_keeps_active_channels(monkeypatch):
+    sockets, retired, closer_threads = [], [], set()
+    closing, release, stopping = threading.Event(), threading.Event(), threading.Event()
+    close_lock = threading.Lock()
+    active_closes = maximum_closes = 0
+    attempts = {}
+
+    class ClosingSocket(FakeSocket):
+        def close(self):
+            nonlocal active_closes, maximum_closes
+            if self in retired:
+                with close_lock:
+                    attempts[self] = attempts.get(self, 0) + 1
+                    closer_threads.add(threading.current_thread())
+                    active_closes += 1
+                    maximum_closes = max(maximum_closes, active_closes)
+                    if active_closes == 8:
+                        closing.set()
+                try:
+                    assert release.wait(3), "Очистка не была освобождена тестом"
+                finally:
+                    with close_lock:
+                        active_closes -= 1
+            super().close()
+
+    def connect(*_args, **_kwargs):
+        socket = ClosingSocket([{"type": "response.created"}, {"type": "response.completed"}])
+        sockets.append(socket)
+        return socket
+
+    def events(session):
+        return pool.events({"prompt_cache_key": session}, account_id="account",
+                           access_token="synthetic", timeout=1)
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 100)
+    pool = SIWCWebSocketPool(idle_timeout=10)
+    active = events("active")
+    try:
+        next(active)
+        active_socket = sockets[0]
+        for index in range(8):
+            list(events(str(index)))
+        retired.extend(sockets[1:])
+        monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 111)
+        for index in range(8, 16):
+            list(events(str(index)))
+        assert closing.wait(1)
+        retired.extend(sockets[9:])
+        monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: 122)
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            assert worker.submit(lambda: list(events("trigger"))).result(timeout=0.5)
+            assert pool.active_requests == 1 and not active_socket.closed
+            assert list(active)[-1]["type"] == "response.completed"
+
+            def stop():
+                stopping.set()
+                pool.close()
+
+            shutdown = worker.submit(stop)
+            try:
+                assert stopping.wait(1) and not shutdown.done()
+            finally:
+                release.set()
+            shutdown.result(timeout=3)
+        assert maximum_closes == 8 and len(attempts) == 16
+        assert set(attempts.values()) == {1}
+        assert all(socket.closed for socket in sockets)
+        for thread in closer_threads:
+            thread.join(timeout=1)
+            assert not thread.is_alive()
+        with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
+            list(events("after-close"))
+        assert caught.value.status == 503
+    finally:
+        release.set()
+        active.close()
         pool.close()
 
 
@@ -541,7 +620,9 @@ def test_pool_lru_evicts_only_idle_channels_and_never_reuses_across_accounts(mon
         for account in ("account-a", "account-b"):
             list(pool.events({"prompt_cache_key": "same"}, account_id=account,
                              access_token="synthetic", timeout=1))
-        assert len(sockets) == 2 and sockets[0].closed and not sockets[1].closed
+        assert len(sockets) == 2 and not sockets[1].closed
+        pool.close()
+        assert sockets[0].closed
     finally:
         pool.close()
 
