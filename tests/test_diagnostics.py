@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import anyio
@@ -130,15 +132,122 @@ def test_exception_log_keeps_category_without_exception_or_traceback_text(caplog
     assert "Traceback" not in caplog.text
 
 
+def test_detached_subprocess_after_uvicorn_logging_configuration(tmp_path):
+    path = tmp_path / "diagnostics.jsonl"
+    code = """
+import fcntl
+import logging.config
+import os
+from codex_as_api import diagnostics
+from uvicorn.config import LOGGING_CONFIG
+logging.config.dictConfig(LOGGING_CONFIG)
+diagnostics.emit('http_start', query='secret-canary')
+fd = os.open(os.environ['CODEX_AS_API_DIAGNOSTICS_PATH'] + '.lock', os.O_WRONLY)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    pass
+else:
+    raise AssertionError('reopened handler did not retain exclusive lock')
+finally:
+    os.close(fd)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env={"CODEX_AS_API_DIAGNOSTICS": "1", "CODEX_AS_API_DIAGNOSTICS_PATH": str(path)},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        start_new_session=True, timeout=10, check=True,
+    )
+    assert "diagnostics write failed" not in result.stderr
+    assert records(path)[0]["stage"] == "http_start"
+    assert "secret-canary" not in path.read_text() + result.stdout + result.stderr
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "diagnostics.jsonl.lock").stat().st_mode & 0o777 == 0o600
+
+
 def test_private_rotation(diagnostic_log):
     handler = diagnostics._LOG.handlers[0]
-    assert handler.maxBytes == 5 * 1024 * 1024 and handler.backupCount == 3
-    handler.maxBytes = 100
-    for _ in range(40):
+    assert handler.max_bytes == 5 * 1024 * 1024 and handler.max_total_bytes == 256 * 1024 * 1024
+    handler.max_bytes = 150
+    for _ in range(8):
         diagnostics.emit("http_start")
     files = sorted(diagnostic_log.parent.iterdir())
-    assert len(files) == 4
+    assert len(files) > 1
     assert all(os.stat(path).st_mode & 0o777 == 0o600 for path in files)
+
+
+def test_retention_and_capacity_warn_without_touching_other_files(diagnostic_log, caplog):
+    handler = diagnostics._LOG.handlers[0]
+    handler.max_bytes = 150
+    handler.max_total_bytes = 450
+    unrelated = diagnostic_log.parent / "unrelated"
+    unrelated.write_text("private-canary")
+    caplog.set_level(logging.WARNING)
+    for _ in range(8):
+        diagnostics.emit("http_start")
+    assert sum(p.stat().st_size for p in diagnostic_log.parent.iterdir() if p != unrelated) <= 450
+    assert "retention incomplete category=capacity" in caplog.text
+    assert unrelated.read_text() == "private-canary"
+    segments = list(diagnostic_log.parent.glob("*.segment.*"))
+    assert segments
+    os.utime(segments[0], (1, 1))
+    diagnostics.emit("http_start")
+    assert not segments[0].exists()
+
+
+def test_startup_prunes_expired_segments_and_refuses_segment_symlink(tmp_path, monkeypatch):
+    path = tmp_path / "diagnostics.jsonl"
+    old = tmp_path / ("diagnostics.jsonl.segment." + "a" * 32)
+    old.write_text("old")
+    os.utime(old, (1, 1))
+    target = tmp_path / "target"
+    target.write_text("protected-canary")
+    link = tmp_path / ("diagnostics.jsonl.segment." + "b" * 32)
+    link.symlink_to(target)
+    monkeypatch.setenv("CODEX_AS_API_DIAGNOSTICS", "1")
+    monkeypatch.setenv("CODEX_AS_API_DIAGNOSTICS_PATH", str(path))
+    with pytest.raises(ValueError):
+        diagnostics._make_logger()
+    assert target.read_text() == "protected-canary"
+    link.unlink()
+    logger = diagnostics._make_logger()
+    try:
+        assert not old.exists()
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+
+def test_lock_rejects_second_writer_and_symlink(diagnostic_log, tmp_path):
+    with pytest.raises(ValueError, match="already in use"):
+        diagnostics._PrivateRotatingFileHandler(str(diagnostic_log))
+    target = tmp_path / "lock-target"
+    target.write_text("protected-canary")
+    path = tmp_path / "other.jsonl"
+    (tmp_path / "other.jsonl.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        diagnostics._PrivateRotatingFileHandler(str(path))
+    assert target.read_text() == "protected-canary"
+
+
+def test_inherited_handler_does_not_write_from_another_process(diagnostic_log, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    handler = diagnostics._LOG.handlers[0]
+    monkeypatch.setattr(handler, "_owner_pid", -1)
+    diagnostics.emit("http_start")
+    assert diagnostic_log.read_text() == ""
+    assert "category=process_changed" in caplog.text
+
+
+def test_diagnostic_allowlist_rejects_content(diagnostic_log):
+    diagnostics.emit("search_completed", stream=True, result_count=2, search_requests=1,
+                     query="query-canary", url="url-canary", reason="error-canary",
+                     output_key_source="completed", output_key_error="invalid_output")
+    data = records(diagnostic_log)[0]
+    assert data["stream"] is True and data["result_count"] == 2 and data["search_requests"] == 1
+    assert data["output_key_source"] == "completed" and data["output_key_error"] == "invalid_output"
+    assert len(data["process_id"]) == 32 and "canary" not in diagnostic_log.read_text()
 
 
 def test_context_correlation_worker_reuse_and_concurrency(diagnostic_log, monkeypatch, caplog):
@@ -188,6 +297,54 @@ def test_context_correlation_worker_reuse_and_concurrency(diagnostic_log, monkey
     assert "canary" not in diagnostic_log.read_text()
     transport_logs = " ".join(r.getMessage() for r in caplog.records if r.name == "codex_as_api.siwc_transport")
     assert "cached=" not in transport_logs and "session=" not in transport_logs
+
+
+def test_selection_and_output_diagnostics_are_correlated(diagnostic_log, monkeypatch):
+    monkeypatch.setattr(siwc_transport, "connect", lambda *a, **kw: FakeSocket([
+        {"type": "response.output_item.done", "item": {"role": "assistant", "content": "answer"}},
+        {"type": "response.completed", "response": {"output": []}},
+    ]))
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "auth-canary", "timeout": 1}
+    root = [{"role": "user", "content": "prompt-canary"}]
+    try:
+        list(pool.events({"input": root}, **options))
+        list(pool.events({"input": [*root, {"role": "assistant", "content": "wrong-canary"}]}, **options))
+    finally:
+        pool.close()
+    data = records(diagnostic_log)
+    selections = [item for item in data if item["stage"] == "channel_selected"]
+    assert [item["selection_reason"] for item in selections] == ["new", "replay_mismatch"]
+    assert selections[1]["free_candidates"] == 1 and selections[1]["busy_candidates"] == 0
+    for selection in selections:
+        related = [item for item in data if item.get("attempt_id") == selection["attempt_id"]]
+        output = next(item for item in related if item["stage"] == "output_key")
+        release = next(item for item in related if item["stage"] == "channel_released")
+        assert output["channel_id"] == release["channel_id"] == selection["channel_id"]
+        assert output["output_key_source"] == "done" and output["output_key_error"] == "none"
+        assert output["done_count"] == 1 and output["completed_count"] == 0
+        assert release["reason"] == "completed"
+    assert "canary" not in diagnostic_log.read_text()
+
+
+@pytest.mark.parametrize("output,expected_error", [
+    ([{"role": "assistant", "content": "answer"}], "none"),
+    ([{"role": "assistant", "content": None}], "invalid_output"),
+])
+def test_completed_output_key_source_and_error_category(diagnostic_log, monkeypatch, output, expected_error):
+    monkeypatch.setattr(siwc_transport, "connect", lambda *a, **kw: FakeSocket([
+        {"type": "response.completed", "response": {"output": output}},
+    ]))
+    pool = SIWCWebSocketPool()
+    try:
+        list(pool.events({"input": [{"role": "user", "content": "secret-canary"}]},
+                         account_id="account", access_token="auth-canary", timeout=1))
+    finally:
+        pool.close()
+    item = next(item for item in records(diagnostic_log) if item["stage"] == "output_key")
+    assert item["output_key_source"] == "completed" and item["output_key_error"] == expected_error
+    assert item["done_count"] == 0 and item["completed_count"] == 1
+    assert "canary" not in diagnostic_log.read_text()
 
 
 @pytest.mark.parametrize("event_type,reason", [

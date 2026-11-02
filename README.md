@@ -394,8 +394,12 @@ On the following assistant-history request, recognized envelopes restore the ori
 
 Multiple summary parts share one thinking block per reasoning item. Encrypted-only items use an empty thinking string with a non-empty signature. Streaming sends `signature_delta` before the matching `content_block_stop`. `display: "omitted"` hides the summary but can preserve an encrypted-only signed block for continuity; disabled thinking suppresses thinking output. Items without encrypted content retain unsigned-summary compatibility behavior.
 
-Hosted Anthropic `web_search` declarations are rejected with HTTP 400 on
-Messages, token-counting, and compact requests. OpenAI Responses cannot supply
+The narrowly identified Claude Code 2.1.316 builtin WebSearch subrequest can use
+an explicitly configured local search command on Messages; see [SIWC.md](SIWC.md#builtin-websearch-claude-code-и-возврат-после-фоновых-форков).
+It returns real plain-text sources and a search-count event, not fabricated
+Anthropic encrypted citations. Other hosted Anthropic `web_search` declarations
+are rejected with HTTP 400 on Messages, token-counting, and compact requests.
+OpenAI Responses cannot supply
 the Anthropic server-tool provenance and encrypted lifecycle fields required to
 translate a hosted result losslessly, so the gateway does not approximate that
 protocol. Provider output containing an unexpected hosted web-search call is an
@@ -849,8 +853,9 @@ CODEX_AS_API_MODEL=gpt-5.6-terra \
 codex-as-api
 ```
 
-Claude Code hosted WebSearch is not supported through this gateway, regardless
-of Responses Lite mode. Classic Responses can execute an OpenAI hosted search,
+Claude Code builtin WebSearch can use the opt-in local search-command bridge
+([SIWC.md](SIWC.md#builtin-websearch-claude-code-и-возврат-после-фоновых-форков)); it does not depend on Responses Lite.
+General Anthropic hosted WebSearch lifecycle remains unsupported. Classic Responses can execute an OpenAI hosted search,
 but its output lacks the Anthropic provenance and encrypted lifecycle data
 needed for a lossless Messages response. WebFetch remains a client-side
 auxiliary request and retains the disabled-thinking precedence behavior when

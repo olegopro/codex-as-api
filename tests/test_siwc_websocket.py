@@ -136,6 +136,119 @@ def test_claude_code_late_system_notes_keep_the_same_channel_and_history_prefix(
     assert continued["input"][-1]["content"][0]["text"] == second[-1].content
 
 
+def test_completed_auxiliary_fork_preserves_main_anchor(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        socket = FakeSocket([test_siwc_provider._completed([test_siwc_provider._text_item("answer")])])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    main = [{"role": "user", "content": "root"}]
+    replay = {"role": "assistant", "content": "answer"}
+    fork = [*main, replay, {"role": "user", "content": "summary"}]
+    continued = [*main, replay, {"role": "user", "content": "continue"}]
+    try:
+        for history in (main, fork, continued):
+            list(pool.events({"input": history}, **options))
+        assert len(sockets) == 1
+        assert [request["input"] for request in sockets[0].sent] == [main, fork, continued]
+    finally:
+        pool.close()
+
+
+def test_multiple_forks_remain_replayable_and_anchors_are_bounded(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        socket = FakeSocket([test_siwc_provider._completed([test_siwc_provider._text_item("answer")])])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    root = [{"role": "user", "content": "root"}]
+    answer = {"role": "assistant", "content": "answer"}
+    try:
+        list(pool.events({"input": root}, **options))
+        for label in ("summary", "suggestion", "summary"):
+            list(pool.events({"input": [*root, answer, {"role": "user", "content": label}]}, **options))
+        list(pool.events({"input": [*root, answer, {"role": "user", "content": "continue"}]}, **options))
+        assert len(sockets) == 1
+        connection = next(iter(pool._connections.values()))
+        assert len(connection.anchors) == 4
+        history = [*root, answer, {"role": "user", "content": "continue"}]
+        for index in range(20):
+            history = [*history, answer, {"role": "user", "content": str(index)}]
+            list(pool.events({"input": history}, **options))
+        assert len(connection.anchors) == 16
+        connection.close()
+        assert not connection.anchors
+    finally:
+        pool.close()
+
+
+def test_longest_valid_anchor_wins_without_waiting(monkeypatch):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        socket = FakeSocket([{"type": "response.created"},
+                             test_siwc_provider._completed([test_siwc_provider._text_item("answer")])])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    root = [{"role": "user", "content": "root"}]
+    answer = {"role": "assistant", "content": "answer"}
+    longer = [*root, answer, {"role": "user", "content": "branch"}]
+    streams = [pool.events({"input": history}, **options) for history in (root, longer)]
+    try:
+        for stream in streams:
+            next(stream)
+        for stream in streams:
+            list(stream)
+        continued = [*longer, answer, {"role": "user", "content": "continue"}]
+        list(pool.events({"input": continued}, **options))
+        assert len(sockets) == 2
+        assert [len(socket.sent) for socket in sockets] == [1, 2]
+        assert sockets[1].sent[-1]["input"] == continued
+    finally:
+        for stream in streams:
+            stream.close()
+        pool.close()
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+def test_failed_or_cancelled_fork_clears_socket_anchors(monkeypatch, failure):
+    socket = FakeSocket([test_siwc_provider._completed([test_siwc_provider._text_item("answer")])])
+    monkeypatch.setattr(siwc_transport, "connect", lambda *args, **kwargs: socket)
+    pool = SIWCWebSocketPool()
+    options = {"account_id": "account", "access_token": "synthetic", "timeout": 1}
+    root = [{"role": "user", "content": "root"}]
+    try:
+        list(pool.events({"input": root}, **options))
+        connection = next(iter(pool._connections.values()))
+        assert len(connection.anchors) == 1
+        socket.events = ([{"type": "error"}] if failure == "error"
+                         else [{"type": "response.created"}, {"type": "response.completed"}])
+        fork = pool.events({"input": [*root, {"role": "assistant", "content": "answer"},
+                                      {"role": "user", "content": "summary"}]}, **options)
+        if failure == "error":
+            list(fork)
+        else:
+            next(fork)
+            fork.close()
+        assert socket.closed and not connection.anchors and connection.users == 0
+    finally:
+        pool.close()
+
+
 def test_background_model_does_not_replace_the_main_models_channel(websocket_provider):
     provider, sockets, calls, _ = websocket_provider()
     for model in ("synthetic-first", "synthetic-second", "synthetic-first"):

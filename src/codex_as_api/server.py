@@ -11,8 +11,9 @@ import re
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import datetime, timezone
+from functools import partial
 from importlib.metadata import PackageNotFoundError, distribution
 from typing import Any, cast
 
@@ -70,6 +71,7 @@ from .provider import (
     validate_codex_cli_version_environment,
 )
 from .strict_json import as_js_safe_integer, strict_json_loads
+from .web_search import builtin_request, message_events, search_message
 
 REQUEST_BODY_LIMIT_BYTES = 50 * 1024 * 1024
 
@@ -284,6 +286,56 @@ async def _anthropic_heartbeat(
                         await anyio.to_thread.run_sync(cancel.cancel, limiter=_anthropic_cancel_limiter)
             finally:
                 tasks.cancel_scope.cancel()
+
+
+async def _builtin_search_message(request: Request, search: Any, model: str) -> dict[str, Any] | None:
+    result = None
+    error: Exception | None = None
+    async with anyio.create_task_group() as tasks:
+        async def disconnected() -> None:
+            if (await request.receive())["type"] == "http.disconnect":
+                diagnostic_emit("cancel_requested")
+                tasks.cancel_scope.cancel()
+
+        tasks.start_soon(disconnected)
+        try:
+            result = await search_message(search, model)
+        except Exception as exc:
+            error = exc
+        finally:
+            tasks.cancel_scope.cancel()
+    if error is not None:
+        raise error
+    return result
+
+
+async def _anthropic_nonstream_call(
+    request: Request, call: Callable[[], Any], cancel: Any,
+) -> Any:
+    cancel_callback = getattr(cancel, "cancel", cancel)
+    if cancel_callback is None:
+        return await run_in_threadpool(call)
+
+    async def disconnected() -> None:
+        message = await request.receive()  # Тело уже полностью прочитано эндпоинтом.
+        if message["type"] == "http.disconnect":
+            diagnostic_emit("cancel_requested")
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(cancel_callback, limiter=_anthropic_cancel_limiter)
+
+    error: Exception | None = None
+    result: Any = None
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(disconnected)
+        try:
+            result = await run_in_threadpool(call)
+        except Exception as exc:  # Не превращать исходную ошибку провайдера в ExceptionGroup.
+            error = exc
+        finally:
+            tasks.cancel_scope.cancel()
+    if error is not None:
+        raise error
+    return result
 
 
 def _error_status(exc: BaseException) -> int:
@@ -2630,7 +2682,32 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             message_count=len(raw_messages) if isinstance(raw_messages, list) else None,
             tool_count=len(body["tools"]) if isinstance(body.get("tools"), list) else None,
             content_items=content_items,
+            stream=body.get("stream", False),
         )
+        search_request = builtin_request(body)
+        if search_request is not None:
+            client_model = body.get("model")
+            stream = body.get("stream", False)
+            if not isinstance(client_model, str) or not client_model:
+                raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string")
+            if not isinstance(stream, bool):
+                raise ChatGPTOAuthInvalidRequestError("stream must be a boolean")
+            resolve_anthropic_thinking_options(cast(dict[str, Any] | None, raw_thinking), max_tokens)
+            try:
+                message = await _builtin_search_message(http_request, search_request, client_model)
+                if message is None:
+                    return JSONResponse(
+                        status_code=499, content=format_anthropic_error(499, "WebSearch client disconnected"),
+                    )
+            except TimeoutError:
+                return JSONResponse(status_code=504, content=format_anthropic_error(504, "WebSearch backend timed out"))
+            except (OSError, ValueError, KeyError):
+                return JSONResponse(
+                    status_code=502, content=format_anthropic_error(502, "WebSearch backend unavailable"),
+                )
+            if stream:
+                return StreamingResponse(message_events(message), media_type="text/event-stream")
+            return JSONResponse(content=message)
         messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
             model=body.get("model"),
             messages=body.get("messages"),
@@ -2805,30 +2882,34 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
 
     # Non-streaming
     try:
-        response = await run_in_threadpool(
-            provider.chat,
-            messages,
-            model=request_model,
-            tools=tools,
-            tool_choice=tool_choice,
-            reasoning_effort=effective_reasoning_effort,
-            reasoning_mode=reasoning_mode,
-            reasoning_context=reasoning_context,
-            reasoning_summary=reasoning_summary,
-            allow_disabled_fallback=allow_disabled_fallback,
-            stop=stop,
-            prompt_cache_key=prompt_cache_key,
-            subagent=subagent,
-            memgen_request=memgen_request,
-            text=text,
-            codex_metadata=False,
-            responses_lite=responses_lite,
-            parallel_tool_calls=parallel_tool_calls,
-            safety_identifier=body.get("safety_identifier"),
-            prompt_cache_options=body.get("prompt_cache_options"),
-            verbosity=body.get("verbosity"),
-            service_tier=service_tier,
-            _prepared_request=prepared_request,
+        response = await _anthropic_nonstream_call(
+            http_request,
+            partial(
+                provider.chat,
+                messages,
+                model=request_model,
+                tools=tools,
+                tool_choice=tool_choice,
+                reasoning_effort=effective_reasoning_effort,
+                reasoning_mode=reasoning_mode,
+                reasoning_context=reasoning_context,
+                reasoning_summary=reasoning_summary,
+                allow_disabled_fallback=allow_disabled_fallback,
+                stop=stop,
+                prompt_cache_key=prompt_cache_key,
+                subagent=subagent,
+                memgen_request=memgen_request,
+                text=text,
+                codex_metadata=False,
+                responses_lite=responses_lite,
+                parallel_tool_calls=parallel_tool_calls,
+                safety_identifier=body.get("safety_identifier"),
+                prompt_cache_options=body.get("prompt_cache_options"),
+                verbosity=body.get("verbosity"),
+                service_tier=service_tier,
+                _prepared_request=prepared_request,
+            ),
+            getattr(prepared_request, "cancel", None),
         )
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)

@@ -100,8 +100,11 @@ class _Connection:
     socket: Any = None
     history: tuple[bytes, ...] | None = None
     output_key: bytes | None = None
+    anchors: deque[tuple[tuple[bytes, ...], bytes | None]] = field(default_factory=lambda: deque(maxlen=16))
+    channel_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def close(self) -> None:
+        had_socket = self.socket is not None
         try:
             self.stack.close()
         finally:
@@ -110,6 +113,9 @@ class _Connection:
             self.token_hash = ""
             self.history = None
             self.output_key = None
+            self.anchors.clear()
+            if had_socket:
+                self.channel_id = uuid.uuid4().hex
 
 
 class SIWCWebSocketPool:
@@ -133,28 +139,39 @@ class SIWCWebSocketPool:
         with self._lock:
             return sum(entry.users for entry in self._connections.values())
 
-    def _reserve(self, key: tuple[str, str, str, str], inputs: list[dict[str, Any]]) -> _Connection:
+    def _reserve(self, key: tuple[str, str, str, str], inputs: list[dict[str, Any]],
+                 request_id: str) -> _Connection:
         expired = []
         history = tuple(_fingerprint(item) for item in inputs)
         replay_keys: dict[int, bytes] = {}
 
+        mismatch_reasons: set[str] = set()
+
         def affinity(candidate: _Connection) -> int:
-            previous = candidate.history
-            if previous is None:
+            if not candidate.anchors:
                 return 0
-            if history == previous:
-                return len(previous) + 1  # Точный повтор тоже сохраняет канал.
-            size = len(previous)
-            if history[:size] != previous or candidate.output_key is None:
-                return -1
-            if size not in replay_keys:
-                replay = []
-                for item in inputs[size:]:
-                    if not _is_output_item(item):
-                        break
-                    replay.append(item)
-                replay_keys[size] = _output_key(replay)
-            return size + 1 if replay_keys[size] == candidate.output_key else -1
+            scores = []
+            for previous, output_key in candidate.anchors:
+                size = len(previous)
+                if history == previous:
+                    scores.append(size + 1)
+                elif history[:size] != previous:
+                    mismatch_reasons.add("input_mismatch")
+                elif output_key is None:
+                    mismatch_reasons.add("missing_key")
+                else:
+                    if size not in replay_keys:
+                        replay = []
+                        for item in inputs[size:]:
+                            if not _is_output_item(item):
+                                break
+                            replay.append(item)
+                        replay_keys[size] = _output_key(replay)
+                    if replay_keys[size] == output_key:
+                        scores.append(size + 1)
+                    else:
+                        mismatch_reasons.add("replay_mismatch")
+            return max(scores, default=-1)
 
         now = time.monotonic()
         with self._lock:
@@ -163,10 +180,15 @@ class SIWCWebSocketPool:
             for old_key, candidate in list(self._connections.items()):
                 if candidate.users == 0 and now - candidate.last_used >= self._idle_timeout:
                     expired.append(self._connections.pop(old_key))
-            candidates = ((affinity(v), k) for k, v in reversed(self._connections.items())
-                          if k[:4] == key and v.users == 0)
+            group = [(k, v) for k, v in reversed(self._connections.items()) if k[:4] == key]
+            free_candidates = sum(v.users == 0 for _, v in group)
+            busy_candidates = len(group) - free_candidates
+            candidates = ((affinity(v), k) for k, v in group if v.users == 0)
             best = max(candidates, key=lambda candidate: candidate[0], default=(-1, None))
             available = best[1] if best[0] >= 0 else None
+            selection_reason = "existing" if available is not None else next(
+                (reason for reason in ("replay_mismatch", "missing_key", "input_mismatch")
+                 if reason in mismatch_reasons), "new")
             if available is None:
                 if self._limit is not None and len(self._connections) >= self._limit:
                     victim = next((k for k, v in self._connections.items() if v.users == 0), None)
@@ -187,6 +209,9 @@ class SIWCWebSocketPool:
             entry.output_key = None
             self._connections.move_to_end(available)
             self._retire_locked(expired)
+            diagnostic_emit("channel_selected", attempt_id=request_id, channel_id=entry.channel_id,
+                            selection_reason=selection_reason,
+                            free_candidates=free_candidates, busy_candidates=busy_candidates)
         return entry
 
     def events(
@@ -200,11 +225,12 @@ class SIWCWebSocketPool:
     ) -> Iterator[dict[str, Any]]:
         key = (account_id, payload.get("prompt_cache_key") or "anonymous",
                payload.get("model", ""), _branch_key(payload))
-        entry = self._reserve(key, payload.get("input", []))
+        request_id = uuid.uuid4().hex[:12]
+        entry = self._reserve(key, payload.get("input", []), request_id)
         history = entry.history
+        channel_id = entry.channel_id
         output: list[dict[str, Any]] = []
         token_hash = hashlib.sha256(access_token.encode()).hexdigest()
-        request_id = uuid.uuid4().hex[:12]
         session_hash = hashlib.sha256(key[1].encode()).hexdigest()[:12]
         started = time.monotonic()
         first_event_ms = first_delta_ms = None
@@ -236,9 +262,9 @@ class SIWCWebSocketPool:
                         connection_reason = "credentials_changed"
                     else:
                         connection_reason = "connection_expired"
-                    diagnostic_emit("upstream_start", attempt_id=request_id, reused=reused, reason=connection_reason)
                     if not reused:
                         entry.close()
+                        channel_id = entry.channel_id
                         entry.socket = entry.stack.enter_context(connect(
                             SIWC_WEBSOCKET_URL,
                             additional_headers={"Authorization": f"Bearer {access_token}"},
@@ -249,6 +275,8 @@ class SIWCWebSocketPool:
                         ))
                         entry.token_hash = token_hash
                         entry.opened_at = time.monotonic()
+                    diagnostic_emit("upstream_start", attempt_id=request_id, channel_id=entry.channel_id,
+                                    reused=reused, reason=connection_reason)
                     socket = entry.socket
 
                     def stop() -> None:
@@ -289,11 +317,24 @@ class SIWCWebSocketPool:
                                         response = event.get("response")
                                         final_output = response.get("output") if isinstance(response, dict) else None
                                         entry.history = history
+                                        key_error = "none"
                                         try:
                                             entry.output_key = _output_key(final_output or output)
                                         except (TypeError, ValueError, KeyError, AttributeError):
                                             # Невалидный ответ проверит provider, не подбор канала.
                                             entry.output_key = None
+                                            key_error = "invalid_output"
+                                        if history is not None:
+                                            anchor = (history, entry.output_key)
+                                            with suppress(ValueError):
+                                                entry.anchors.remove(anchor)
+                                            entry.anchors.append(anchor)
+                                        diagnostic_emit("output_key", attempt_id=request_id,
+                                                        channel_id=entry.channel_id,
+                                                        output_key_source="completed" if final_output else "done",
+                                                        output_key_error=key_error, done_count=len(output),
+                                                        completed_count=(len(final_output)
+                                                                         if isinstance(final_output, list) else 0))
                                         usage = response.get("usage") if isinstance(response, dict) else None
                                         if isinstance(usage, dict):
                                             details = usage.get("input_tokens_details")
@@ -355,6 +396,8 @@ class SIWCWebSocketPool:
             with self._lock:
                 entry.users -= 1
                 entry.last_used = time.monotonic()
+                diagnostic_emit("channel_released", attempt_id=request_id, channel_id=channel_id,
+                                reason="completed" if completed else terminal_reason)
 
     def _retire_locked(self, entries: list[_Connection]) -> None:
         self._retired.extend(entries)
