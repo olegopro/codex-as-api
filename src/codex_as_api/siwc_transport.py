@@ -22,6 +22,10 @@ from websockets.protocol import State
 from websockets.sync.client import connect
 
 from .auth import ChatGPTOAuthProtocolError, ChatGPTOAuthUpstreamError
+from .diagnostics import current as diagnostic_context
+from .diagnostics import emit as diagnostic_emit
+from .diagnostics import enabled as diagnostics_enabled
+from .diagnostics import safe_model
 from .strict_json import strict_json_loads
 
 SIWC_WEBSOCKET_URL = "wss://api.openai.com/v1/responses"
@@ -206,8 +210,14 @@ class SIWCWebSocketPool:
         first_event_ms = first_delta_ms = None
         completed = False
         reused = False
-        _LOG.info("SIWC WS start request=%s model=%s session=%s branch=%s active=%s",
-                  request_id, key[2], session_hash, key[3][:12], self.active_requests)
+        terminal_reason = "interrupted"
+        diagnostic_emit("upstream_start", attempt_id=request_id, session_hash=session_hash, branch_hash=key[3][:12],
+                        model=payload.get("model"))
+        if diagnostics_enabled():
+            _LOG.info("SIWC WS start request=%s", request_id)
+        else:
+            _LOG.info("SIWC WS start request=%s model=%s session=%s branch=%s active=%s",
+                      request_id, safe_model(key[2]), session_hash, key[3][:12], self.active_requests)
         try:
             with entry.lock:
                 try:
@@ -216,6 +226,17 @@ class SIWCWebSocketPool:
                     reused = (entry.socket is not None and getattr(entry.socket, "state", State.OPEN) == State.OPEN
                               and entry.token_hash == token_hash
                               and time.monotonic() - entry.opened_at < 3300.0)
+                    if reused:
+                        connection_reason = "reused"
+                    elif entry.socket is None:
+                        connection_reason = "no_socket"
+                    elif getattr(entry.socket, "state", State.OPEN) != State.OPEN:
+                        connection_reason = "socket_closed"
+                    elif entry.token_hash != token_hash:
+                        connection_reason = "credentials_changed"
+                    else:
+                        connection_reason = "connection_expired"
+                    diagnostic_emit("upstream_start", attempt_id=request_id, reused=reused, reason=connection_reason)
                     if not reused:
                         entry.close()
                         entry.socket = entry.stack.enter_context(connect(
@@ -261,6 +282,9 @@ class SIWCWebSocketPool:
                                     output.append(event["item"])
                                 if event["type"] in _TERMINAL_EVENTS:
                                     completed = event["type"] == "response.completed"
+                                    terminal_reason = {"response.failed": "upstream_failed",
+                                                       "response.incomplete": "upstream_incomplete",
+                                                       "error": "upstream_error"}.get(event["type"], "interrupted")
                                     if completed:
                                         response = event.get("response")
                                         final_output = response.get("output") if isinstance(response, dict) else None
@@ -275,14 +299,27 @@ class SIWCWebSocketPool:
                                             details = usage.get("input_tokens_details")
                                             cached = details.get("cached_tokens") if isinstance(details, dict) else None
                                             counters = (usage.get("input_tokens"), cached, usage.get("output_tokens"))
-                                            if all(v is None or (isinstance(v, int) and not isinstance(v, bool))
-                                                   for v in counters):
+                                            if not diagnostics_enabled() and all(
+                                                v is None or (isinstance(v, int) and not isinstance(v, bool))
+                                                for v in counters
+                                            ):
                                                 _LOG.info("SIWC WS model=%s input=%s cached=%s output=%s session=%s "
                                                           "branch=%s request=%s elapsed_ms=%s first_event_ms=%s "
                                                           "first_delta_ms=%s reused=%s",
-                                                          payload.get("model"), *counters,
+                                                          safe_model(key[2]), *counters,
                                                           session_hash, key[3][:12], request_id, elapsed_ms,
                                                           first_event_ms, first_delta_ms, reused)
+                                        else:
+                                            counters = (None, None, None)
+                                        if diagnostics_enabled():
+                                            _LOG.info("SIWC WS completed request=%s", request_id)
+                                        diagnostic_emit("upstream_completed", attempt_id=request_id,
+                                                        input_tokens=counters[0], cached_tokens=counters[1],
+                                                        output_tokens=counters[2],
+                                                        total_tokens=(usage.get("total_tokens")
+                                                                      if isinstance(usage, dict) else None),
+                                                        elapsed_ms=elapsed_ms, first_event_ms=first_event_ms,
+                                                        first_delta_ms=first_delta_ms, reused=reused)
                                     yield event
                                     return
                                 yield event
@@ -303,10 +340,18 @@ class SIWCWebSocketPool:
                     raise OSError(str(exc)) from exc
         finally:
             if not completed:
-                _LOG.info("SIWC WS interrupted request=%s model=%s session=%s branch=%s elapsed_ms=%s "
-                          "first_event_ms=%s first_delta_ms=%s",
-                          request_id, key[2], session_hash, key[3][:12],
-                          round((time.monotonic() - started) * 1000), first_event_ms, first_delta_ms)
+                if (context := diagnostic_context()) is not None:
+                    context["failed"] = True
+                diagnostic_emit("upstream_error", attempt_id=request_id, reason=terminal_reason,
+                                elapsed_ms=round((time.monotonic() - started) * 1000),
+                                first_event_ms=first_event_ms, first_delta_ms=first_delta_ms, reused=reused)
+                if diagnostics_enabled():
+                    _LOG.info("SIWC WS interrupted request=%s", request_id)
+                else:
+                    _LOG.info("SIWC WS interrupted request=%s model=%s session=%s branch=%s elapsed_ms=%s "
+                              "first_event_ms=%s first_delta_ms=%s",
+                              request_id, safe_model(key[2]), session_hash, key[3][:12],
+                              round((time.monotonic() - started) * 1000), first_event_ms, first_delta_ms)
             with self._lock:
                 entry.users -= 1
                 entry.last_used = time.monotonic()
@@ -328,7 +373,7 @@ class SIWCWebSocketPool:
             try:
                 entry.close()
             except Exception:
-                _LOG.warning("SIWC WebSocket cleanup failed", exc_info=True)
+                _LOG.warning("SIWC WebSocket cleanup failed category=cleanup_error")
 
     def close(self) -> None:
         with self._lock:

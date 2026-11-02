@@ -48,6 +48,10 @@ from .auth import (
 )
 from .codex_config import CodexConfig, load_codex_config
 from .device_login import DeviceLoginManager, LoginError
+from .diagnostics import LifecycleMiddleware
+from .diagnostics import current as diagnostic_context
+from .diagnostics import emit as diagnostic_emit
+from .diagnostics import enabled as diagnostics_enabled
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import (
     ModelCapability,
@@ -301,7 +305,15 @@ def _error_status(exc: BaseException) -> int:
 
 
 def _public_error_message(exc: BaseException) -> str:
-    logging.getLogger("uvicorn.error").warning("%s: %s", type(exc).__name__, exc, exc_info=exc)
+    frames = []
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename
+        if filename.startswith(os.path.dirname(__file__) + os.sep):
+            frames.append(f"{os.path.basename(filename)}:{tb.tb_lineno}")
+        tb = tb.tb_next
+    error_type = type(exc).__name__ if type(exc).__module__ in {"builtins", "codex_as_api.auth"} else "Exception"
+    logging.getLogger("uvicorn.error").warning("%s category=%s stack=%s", error_type, _error_type(exc), frames)
     if isinstance(exc, (ChatGPTOAuthMissingError, ChatGPTOAuthRefreshError)):
         return "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
     if isinstance(exc, (ChatGPTOAuthInvalidRequestError, ChatGPTOAuthModelNotFoundError)):
@@ -629,10 +641,13 @@ async def _strict_json_request_middleware(request: Request, call_next: Any) -> A
                 return _request_transport_error_response(request, 413, "request body exceeds 50 MiB")
         raw = bytes(raw_buffer)
         request._body = raw  # Starlette caches request bodies here for downstream consumers.
+        diagnostic_emit("request_metadata", body_bytes=len(raw))
         if raw:
             try:
                 strict_json_loads(raw)
-            except (UnicodeDecodeError, ValueError):
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                if (context := diagnostic_context()) is not None:
+                    context["reason"] = "invalid_json"
                 error = ChatGPTOAuthInvalidRequestError("request body must contain valid JSON")
                 if request.url.path.startswith("/v1/messages"):
                     return JSONResponse(
@@ -654,6 +669,8 @@ async def _strict_json_request_middleware(request: Request, call_next: Any) -> A
 
 
 def _request_transport_error_response(request: Request, status: int, message: str) -> JSONResponse:
+    if (context := diagnostic_context()) is not None:
+        context["reason"] = "body_too_large" if status == 413 else "invalid_content_type"
     if request.url.path.startswith("/v1/messages"):
         return JSONResponse(status_code=status, content=format_anthropic_error(status, message))
     error_type = "invalid_request_error"
@@ -903,6 +920,14 @@ async def _unexpected_error_handler(
             }
         },
     )
+
+
+async def _lifecycle_error_response(scope: Any, receive: Any, send: Any, exc: Exception) -> None:
+    response = await _unexpected_error_handler(Request(scope, receive), exc)
+    await response(scope, receive, send)
+
+
+app.add_middleware(LifecycleMiddleware, error_response=_lifecycle_error_response)
 
 
 # ------------------------------------------------------------------
@@ -2151,6 +2176,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     for provider_event in provider_events:
                         yield _validate_openai_provider_event(provider_event)
                 except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
+                    if (context := diagnostic_context()) is not None:
+                        context["failed"] = True
+                    diagnostic_emit("upstream_error", reason="stream_error")
                     yield {"type": "_stream_error", "error": exc}
 
             for event in _provider_events():
@@ -2584,8 +2612,25 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             body,
             claude_session_id,
         )
+        if prompt_cache_key and (context := diagnostic_context()) is not None:
+            context["session_hash"] = hashlib.sha256(prompt_cache_key.encode()).hexdigest()[:12]
         _validate_anthropic_context_management(body.get("context_management"))
         raw_thinking = body.get("thinking")
+        raw_messages = body.get("messages")
+        content_items = None
+        if diagnostics_enabled() and isinstance(raw_messages, list):
+            content_items = sum(
+                len(content) if isinstance(content, list) else int(isinstance(content, str))
+                for message in raw_messages if isinstance(message, dict)
+                for content in (message.get("content"),)
+            )
+        diagnostic_emit(
+            "request_metadata",
+            thinking_display=raw_thinking.get("display") if isinstance(raw_thinking, dict) else None,
+            message_count=len(raw_messages) if isinstance(raw_messages, list) else None,
+            tool_count=len(body["tools"]) if isinstance(body.get("tools"), list) else None,
+            content_items=content_items,
+        )
         messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
             model=body.get("model"),
             messages=body.get("messages"),
@@ -2606,6 +2651,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         )
         parallel_tool_calls = anthropic_parallel_tool_calls(cast(dict[str, Any] | None, body.get("tool_choice")))
     except (ValueError, ChatGPTOAuthInvalidRequestError) as exc:
+        if str(exc).startswith("thinking.display must be ") and (context := diagnostic_context()) is not None:
+            context["reason"] = "thinking_display_invalid"
         return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
 
     local_stop_sequences = stop if getattr(provider, "backend", BACKEND) == "siwc" else None
@@ -2638,6 +2685,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             body.get("reasoning"),
         )
         service_tier = _anthropic_service_tier(body)
+        diagnostic_emit("request_metadata", effort=effective_reasoning_effort)
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)
         return JSONResponse(status_code=status, content=format_anthropic_error(status, _public_error_message(exc)))
@@ -2736,6 +2784,9 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                     stop_sequences=local_stop_sequences,
                 )
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
+                if (context := diagnostic_context()) is not None:
+                    context["failed"] = True
+                diagnostic_emit("upstream_error", reason="stream_error")
                 status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
                 error = format_anthropic_error(status, _public_error_message(exc))
                 yield f"event: error\ndata: {json.dumps(error, ensure_ascii=False)}\n\n"

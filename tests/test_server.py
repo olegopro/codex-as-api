@@ -6053,6 +6053,36 @@ def test_anthropic_messages_thinking_display_summarized_vs_omitted_and_replay(
     assert captured_summaries == ["auto", "none", "auto", "none"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_updates_passes_without_400_and_requests_no_summary(client, monkeypatch, stream):
+    import codex_as_api.server as server_mod
+
+    summaries = []
+
+    def fake_sse(_path, payload, extra_headers=None):
+        summaries.append(payload.get("reasoning", {}).get("summary"))
+        yield {"type": "response.output_item.done", "item": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "updates answer"}],
+        }}
+        yield {"type": "response.completed", "response": {
+            "id": "resp-updates", "output": [],
+            "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7,
+                      "input_tokens_details": {"cached_tokens": 0}},
+        }}
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", fake_sse)
+    body = {"model": "gpt-5.6-sol", "max_tokens": 2048, "stream": stream,
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "messages": [{"role": "user", "content": "solve"}]}
+    counted = client.post("/v1/messages/count_tokens", json={k: v for k, v in body.items() if k != "stream"})
+    assert counted.status_code == 200, counted.text
+    response = client.post("/v1/messages", json=body)
+    assert response.status_code == 200, response.text
+    assert "updates answer" in response.text and 'event: error' not in response.text
+    assert summaries == ["none"]
+
+
 @pytest.mark.parametrize(
     "unsupported",
     [

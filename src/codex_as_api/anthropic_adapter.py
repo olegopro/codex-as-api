@@ -565,8 +565,9 @@ def resolve_anthropic_thinking_options(
     thinking_type = thinking.get("type")
     if thinking_type == "disabled":
         return "omitted", "none", True
-    display = "omitted" if thinking.get("display") == "omitted" else "summarized"
-    reasoning_summary = "none" if display == "omitted" else "auto"
+    display = thinking.get("display") or "summarized"
+    # Нет отдельного upstream-канала progress: updates скрывает reasoning, сохраняя replay.
+    reasoning_summary = "none" if display in {"omitted", "updates"} else "auto"
     return display, reasoning_summary, False
 
 
@@ -579,8 +580,10 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "enabled":
         _reject_unknown_fields(thinking, {"type", "budget_tokens", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
-            raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
+        if display is not None and (
+            not isinstance(display, str) or display not in {"summarized", "omitted", "updates"}
+        ):
+            raise ValueError("thinking.display must be 'summarized', 'omitted' or 'updates' when provided")
         budget_tokens = thinking.get("budget_tokens")
         parsed_budget_tokens = as_js_safe_integer(budget_tokens)
         if parsed_budget_tokens is None or parsed_budget_tokens < 1024:
@@ -591,8 +594,10 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "adaptive":
         _reject_unknown_fields(thinking, {"type", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
-            raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
+        if display is not None and (
+            not isinstance(display, str) or display not in {"summarized", "omitted", "updates"}
+        ):
+            raise ValueError("thinking.display must be 'summarized', 'omitted' or 'updates' when provided")
         return "medium"
     if thinking_type == "disabled":
         _reject_unknown_fields(thinking, {"type"}, "thinking")
@@ -781,6 +786,11 @@ def _extract_response_reasoning_entry(
     return raw_item, raw_model or default_model
 
 
+def _validate_updates_reasoning(display: str, text: str) -> None:
+    if display == "updates" and text:
+        raise ChatGPTOAuthProtocolError("provider returned reasoning text for updates-only display")
+
+
 def internal_response_to_anthropic(
     response: AssistantResponse,
     model: str,
@@ -791,8 +801,8 @@ def internal_response_to_anthropic(
     thinking_disabled: bool = False,
     stop_sequences: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    if thinking_display not in {"summarized", "omitted"}:
-        raise ValueError("thinking_display must be 'summarized' or 'omitted'")
+    if thinking_display not in {"summarized", "omitted", "updates"}:
+        raise ValueError("thinking_display must be 'summarized', 'omitted' or 'updates'")
     if backend_model is not None and (
         not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
     ):
@@ -811,6 +821,7 @@ def internal_response_to_anthropic(
     _reject_unrepresentable_response_events(response.raw)
 
     visible_reasoning_parts: list[str] = []
+    _validate_updates_reasoning(thinking_display, response.reasoning_content or "")
     if not thinking_disabled:
         if response.reasoning_items:
             for entry in response.reasoning_items:
@@ -823,6 +834,7 @@ def internal_response_to_anthropic(
                 except ValueError as exc:
                     raise ChatGPTOAuthProtocolError(str(exc)) from exc
                 item_text = item_summary + item_raw
+                _validate_updates_reasoning(thinking_display, item_text)
                 if item_text:
                     visible_reasoning_parts.append(item_text)
                 encrypted_content = raw_item.get("encrypted_content")
@@ -837,7 +849,7 @@ def internal_response_to_anthropic(
                         raise ChatGPTOAuthProtocolError(str(exc)) from exc
                     if signature is None:
                         raise ChatGPTOAuthProtocolError("encrypted reasoning item failed to produce a signature")
-                    thinking_text = "" if thinking_display == "omitted" else item_text
+                    thinking_text = "" if thinking_display in {"omitted", "updates"} else item_text
                     content.append(
                         {
                             "type": "thinking",
@@ -1057,8 +1069,8 @@ def anthropic_stream_adapter(
     stop_sequences: Sequence[str] | None = None,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
-    if thinking_display not in {"summarized", "omitted"}:
-        raise ValueError("thinking_display must be 'summarized' or 'omitted'")
+    if thinking_display not in {"summarized", "omitted", "updates"}:
+        raise ValueError("thinking_display must be 'summarized', 'omitted' or 'updates'")
     if backend_model is not None and (
         not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
     ):
@@ -1284,9 +1296,10 @@ def _render_anthropic_stream_events(
                         "provider reasoning delta item_id does not match open thinking section"
                     )
                 pending_thinking_item_id = event_item_id
+            _validate_updates_reasoning(thinking_display, text)
             saw_pending_thinking_delta = True
             pending_thinking_parts.append(text)
-            if thinking_disabled or thinking_display == "omitted":
+            if thinking_disabled or thinking_display in {"omitted", "updates"}:
                 continue
             if current_block != "thinking":
                 if current_block is not None:
@@ -1361,6 +1374,7 @@ def _render_anthropic_stream_events(
             except ValueError as exc:
                 raise ChatGPTOAuthProtocolError(str(exc)) from exc
             expected_text = item_summary + item_raw
+            _validate_updates_reasoning(thinking_display, expected_text)
             if pending_thinking_item_id is not None and item_id != pending_thinking_item_id:
                 raise ChatGPTOAuthProtocolError("provider reasoning_item id does not match streamed reasoning deltas")
             if saw_pending_thinking_delta and "".join(pending_thinking_parts) != expected_text:
@@ -1384,7 +1398,7 @@ def _render_anthropic_stream_events(
                         raise ChatGPTOAuthProtocolError(str(exc)) from exc
                     if signature is None:
                         raise ChatGPTOAuthProtocolError("provider reasoning_item failed to produce a signature")
-                    if thinking_display == "omitted":
+                    if thinking_display in {"omitted", "updates"}:
                         if current_block is not None:
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                             block_index += 1
