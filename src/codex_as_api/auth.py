@@ -143,9 +143,11 @@ class _AuthWriteCleanupError(RuntimeError):
 
 
 class ChatGPTOAuthUpstreamError(ChatGPTOAuthError):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, code: str | None = None) -> None:
         super().__init__(message)
         self.status = status
+        # Машинный код OpenAI (`error.code`), если upstream его прислал.
+        self.code = code
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

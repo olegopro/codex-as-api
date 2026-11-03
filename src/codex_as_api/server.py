@@ -356,6 +356,24 @@ def _error_status(exc: BaseException) -> int:
     return 500
 
 
+def _plan_error_code(exc: BaseException) -> str | None:
+    """Код отказа плана ChatGPT (`subscription_sharing_*`) — его текст показывается клиенту."""
+    code = getattr(exc, "code", None) if isinstance(exc, ChatGPTOAuthUpstreamError) else None
+    return code if isinstance(code, str) and code.startswith("subscription_sharing_") else None
+
+
+def _error_code(exc: BaseException) -> str:
+    return _plan_error_code(exc) or _error_type(exc)
+
+
+def _anthropic_error_status(exc: BaseException) -> int:
+    # Лимит плана держится часами: на 429 Claude Code крутит свои повторы, а
+    # `invalid_request_error` 400 он не повторяет и сразу показывает текст отказа.
+    if _plan_error_code(exc) == "subscription_sharing_usage_limit_exceeded":
+        return 400
+    return _error_status(exc)
+
+
 def _public_error_message(exc: BaseException) -> str:
     frames = []
     tb = exc.__traceback__
@@ -365,7 +383,11 @@ def _public_error_message(exc: BaseException) -> str:
             frames.append(f"{os.path.basename(filename)}:{tb.tb_lineno}")
         tb = tb.tb_next
     error_type = type(exc).__name__ if type(exc).__module__ in {"builtins", "codex_as_api.auth"} else "Exception"
-    logging.getLogger("uvicorn.error").warning("%s category=%s stack=%s", error_type, _error_type(exc), frames)
+    plan_code = _plan_error_code(exc)
+    logging.getLogger("uvicorn.error").warning(
+        "%s category=%s%s stack=%s",
+        error_type, _error_type(exc), f" code={plan_code}" if plan_code else "", frames,
+    )
     if isinstance(exc, (ChatGPTOAuthMissingError, ChatGPTOAuthRefreshError)):
         return "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
     if isinstance(exc, (ChatGPTOAuthInvalidRequestError, ChatGPTOAuthModelNotFoundError)):
@@ -374,6 +396,8 @@ def _public_error_message(exc: BaseException) -> str:
         return "authenticated model catalog is unavailable"
     if isinstance(exc, ChatGPTOAuthProtocolError):
         return "upstream protocol validation failed"
+    if plan_code is not None:
+        return f"{exc} [{plan_code}; usage: ChatGPT Settings > Usage]"
     if isinstance(exc, ChatGPTOAuthUpstreamError):
         return "upstream request failed"
     return "internal server error"
@@ -903,6 +927,7 @@ async def _management_status() -> JSONResponse:
 async def _chatgpt_oauth_error_handler(request: Request, exc: ChatGPTOAuthError) -> JSONResponse:
     status = _error_status(exc)
     if request.url.path.startswith("/v1/messages"):
+        status = _anthropic_error_status(exc)
         return JSONResponse(
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),
@@ -914,7 +939,7 @@ async def _chatgpt_oauth_error_handler(request: Request, exc: ChatGPTOAuthError)
             "error": {
                 "message": _public_error_message(exc),
                 "type": error_type,
-                "code": error_type,
+                "code": _error_code(exc),
             }
         },
     )
@@ -2242,7 +2267,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         "error": {
                             "message": _public_error_message(exc),
                             "type": error_type,
-                            "code": error_type,
+                            "code": _error_code(exc),
                         }
                     }
                     yield f"data: {json.dumps(error)}\n\n"
@@ -2589,7 +2614,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
         context_window = _context_window(capability)
         auto_compact_token_limit = None if context_window is None else _auto_compact_token_limit(capability)
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),
@@ -2764,7 +2789,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         service_tier = _anthropic_service_tier(body)
         diagnostic_emit("request_metadata", effort=effective_reasoning_effort)
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(status_code=status, content=format_anthropic_error(status, _public_error_message(exc)))
 
     try:
@@ -2774,7 +2799,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             client_model,
         )
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),
@@ -2815,7 +2840,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             _resolved_model=resolved_model,
         )
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),
@@ -2864,7 +2889,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                 if (context := diagnostic_context()) is not None:
                     context["failed"] = True
                 diagnostic_emit("upstream_error", reason="stream_error")
-                status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
+                status = _anthropic_error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
                 error = format_anthropic_error(status, _public_error_message(exc))
                 yield f"event: error\ndata: {json.dumps(error, ensure_ascii=False)}\n\n"
 
@@ -2874,7 +2899,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                 media_type="text/event-stream",
             )
         except ChatGPTOAuthError as exc:
-            status = _error_status(exc)
+            status = _anthropic_error_status(exc)
             return JSONResponse(
                 status_code=status,
                 content=format_anthropic_error(status, _public_error_message(exc)),
@@ -2912,7 +2937,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             getattr(prepared_request, "cancel", None),
         )
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(status_code=status, content=format_anthropic_error(status, _public_error_message(exc)))
 
     request_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -2927,7 +2952,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             stop_sequences=local_stop_sequences,
         )
     except ChatGPTOAuthError as exc:
-        status = _error_status(exc)
+        status = _anthropic_error_status(exc)
         return JSONResponse(
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),

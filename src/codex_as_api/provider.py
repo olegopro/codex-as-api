@@ -445,6 +445,39 @@ def _http_error_body(
     return redact_text(body, *token_values)
 
 
+# Отказы плана SIWC и их HTTP-статусы по Errors and recovery; `response.failed`
+# посреди потока приходит без `status`, поэтому статус берётся из этой карты.
+_SUBSCRIPTION_SHARING_STATUS = {
+    "subscription_sharing_usage_limit_exceeded": 429,
+    "subscription_sharing_user_not_eligible": 403,
+    "subscription_sharing_usage_unavailable": 503,
+}
+
+
+def _upstream_error_code(value: object) -> str | None:
+    """`error.code` из события потока или JSON-тела HTTP-ошибки; иначе None."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dict):
+        return None
+    response = value.get("response")
+    error = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict):
+        error = value.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def _upstream_event_error(event: dict[str, Any], status_label: str) -> ChatGPTOAuthUpstreamError:
+    """Отказ из события потока с кодом OpenAI: отказ плана сохраняет свой статус, а не 502."""
+    code = _upstream_error_code(event)
+    status = _SUBSCRIPTION_SHARING_STATUS.get(code or "", 502)
+    return ChatGPTOAuthUpstreamError(status, response_failure_message(event, status_label), code=code)
+
+
 def _redact_failure_event(
     value: Any,
     token_values: tuple[str | None, ...],
@@ -1238,15 +1271,9 @@ class ChatGPTOAuthProvider:
                         raw_delta_event["item_id"] = active_reasoning_item_id
                     yield raw_delta_event
             elif typ == "response.failed":
-                raise ChatGPTOAuthUpstreamError(
-                    502,
-                    response_failure_message(event, "failed"),
-                )
+                raise _upstream_event_error(event, "failed")
             elif typ == "response.incomplete":
-                raise ChatGPTOAuthUpstreamError(
-                    502,
-                    response_failure_message(event, "incomplete"),
-                )
+                raise _upstream_event_error(event, "incomplete")
             elif typ == "response.completed":
                 response = _validated_completed_response(event)
                 usage = response.get("usage")
@@ -1477,15 +1504,9 @@ class ChatGPTOAuthProvider:
                     raise ChatGPTOAuthProtocolError("response.output_item.done must contain an object item")
                 output_items.append(item)
             elif typ == "response.failed":
-                raise ChatGPTOAuthUpstreamError(
-                    502,
-                    response_failure_message(event, "failed"),
-                )
+                raise _upstream_event_error(event, "failed")
             elif typ == "response.incomplete":
-                raise ChatGPTOAuthUpstreamError(
-                    502,
-                    response_failure_message(event, "incomplete"),
-                )
+                raise _upstream_event_error(event, "incomplete")
             elif typ == "response.completed":
                 _validated_completed_response(event)
                 return output_items
@@ -1854,7 +1875,9 @@ class ChatGPTOAuthProvider:
                         self._refresh_after_unauthorized(token)
                         continue
                     redacted = _http_error_body(exc, ws_token_values, deadline=time.monotonic() + self.timeout)
-                    raise ChatGPTOAuthUpstreamError(exc.code, f"SIWC WebSocket handshake failed: {redacted}") from exc
+                    raise ChatGPTOAuthUpstreamError(
+                        exc.code, f"SIWC WebSocket handshake failed: {redacted}", code=_upstream_error_code(redacted),
+                    ) from exc
                 except OSError as exc:
                     raise ChatGPTOAuthUpstreamError(
                         502, f"SIWC WebSocket transport failed: {redact_text(str(exc), *ws_token_values)}",
@@ -1941,6 +1964,7 @@ class ChatGPTOAuthProvider:
                 raise ChatGPTOAuthUpstreamError(
                     exc.code,
                     f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}",
+                    code=_upstream_error_code(redacted),
                 ) from exc
             except ChatGPTOAuthError:
                 raise
@@ -1999,6 +2023,7 @@ class ChatGPTOAuthProvider:
                 raise ChatGPTOAuthUpstreamError(
                     exc.code,
                     f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}",
+                    code=_upstream_error_code(redacted),
                 ) from exc
             except ChatGPTOAuthError:
                 raise
@@ -2126,7 +2151,7 @@ def _siwc_response_events(stream: Iterator[dict[str, Any]]) -> Iterator[dict[str
             _validate_response_event(event)
             typ = event.get("type")
             if typ in {"response.failed", "response.incomplete"}:
-                raise ChatGPTOAuthUpstreamError(502, response_failure_message(event, str(typ)))
+                raise _upstream_event_error(event, str(typ))
             if completed is not None:
                 raise ChatGPTOAuthProtocolError("После response.completed получено лишнее событие")
             if typ == "response.completed":
@@ -2365,10 +2390,7 @@ def _validate_response_event(event: object) -> dict[str, Any]:
     if not isinstance(event_type, str):
         raise ChatGPTOAuthProtocolError("ChatGPT OAuth SSE event requires a string type")
     if event_type == "error":
-        raise ChatGPTOAuthUpstreamError(
-            502,
-            response_failure_message(event, "error"),
-        )
+        raise _upstream_event_error(event, "error")
     if event_type in _UNSUPPORTED_RESPONSE_EVENT_TYPES:
         raise ChatGPTOAuthProtocolError("ChatGPT OAuth SSE event has an unsupported semantic type")
     if event_type not in _RESPONSE_EVENT_TYPES:

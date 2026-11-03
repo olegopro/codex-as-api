@@ -3375,6 +3375,93 @@ def test_anthropic_runtime_stream_failure_is_reported_in_band(client, monkeypatc
     assert "sentinel" not in response.text
 
 
+# Живое событие SIWC 2026-11-03: исчерпан лимит Subscription Sharing.
+_PLAN_LIMIT_MESSAGE = "The ChatGPT user has reached their Subscription Sharing usage limit."
+_PLAN_LIMIT_EVENT = {
+    "type": "error",
+    "error": {
+        "message": _PLAN_LIMIT_MESSAGE,
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "subscription_sharing_usage_limit_exceeded",
+    },
+    "status": 429,
+    "sequence_number": 3,
+}
+
+
+def _plan_limit_sse(_path, _payload, extra_headers=None):  # noqa: ANN001
+    del extra_headers
+    yield _PLAN_LIMIT_EVENT
+
+
+def test_anthropic_plan_usage_limit_is_final_and_explained(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", _plan_limit_sse)
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert _PLAN_LIMIT_MESSAGE in error["message"]
+    assert "subscription_sharing_usage_limit_exceeded" in error["message"]
+
+
+def test_anthropic_plan_usage_limit_mid_stream_is_final_and_explained(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    def failing_sse(_path, _payload, extra_headers=None):  # noqa: ANN001
+        del extra_headers
+        yield {"type": "response.output_text.delta", "delta": "partial"}
+        yield {
+            "type": "response.failed",
+            "response": {"error": {
+                "message": _PLAN_LIMIT_MESSAGE,
+                "code": "subscription_sharing_usage_limit_exceeded",
+            }},
+        }
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", failing_sse)
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "stream": True,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert "event: error" in response.text
+    assert '"invalid_request_error"' in response.text
+    assert _PLAN_LIMIT_MESSAGE in response.text
+
+
+def test_openai_plan_usage_limit_keeps_status_and_code(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", _plan_limit_sse)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["code"] == "subscription_sharing_usage_limit_exceeded"
+    assert _PLAN_LIMIT_MESSAGE in error["message"]
+
+
 def test_request_validation_error_does_not_reflect_invalid_input(client):
     response = client.post(
         "/v1/chat/completions",
