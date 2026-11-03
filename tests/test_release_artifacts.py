@@ -41,7 +41,7 @@ def make_wheel(path: Path, name: str = "codex-as-api", version: str = "0.7.0") -
         )
         archive.writestr(
             "codex_as_api-0.7.0.dist-info/entry_points.txt",
-            "[console_scripts]\ncodex-as-api = codex_as_api.server:main\n",
+            "[console_scripts]\ncodex-as-api = codex_as_api.cli:main\n",
         )
 
 

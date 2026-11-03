@@ -47,7 +47,7 @@ NPM_EXPORTS_METADATA = {
     }
 }
 NPM_BIN_METADATA = {"codex-as-api": "dist/cli.js"}
-PYTHON_CONSOLE_SCRIPTS = {"codex-as-api": "codex_as_api.server:main"}
+PYTHON_CONSOLE_SCRIPTS = {"codex-as-api": "codex_as_api.cli:main"}
 RUST_REQUIRED_TEXT_SOURCES = {
     "LICENSE": REPOSITORY_ROOT / "LICENSE",
     "THIRD_PARTY_NOTICES.md": REPOSITORY_ROOT / "rust" / "THIRD_PARTY_NOTICES.md",
