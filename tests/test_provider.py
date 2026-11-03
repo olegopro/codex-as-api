@@ -3038,6 +3038,17 @@ def test_live_reasoning_summary_controls_determine_private_wire_payload(
     assert payload["include"] == ["reasoning.encrypted_content"]
 
 
+@pytest.mark.parametrize("summary", ["none", "omitted"])
+def test_hidden_reasoning_summary_is_not_an_invalid_wire_enum(model_catalog_snapshot, summary):
+    capability = replace(model_catalog_snapshot.models[0], use_responses_lite=False)
+    payload = {"input": [], "reasoning": {"summary": "auto"}}
+    provider_module._finalize_responses_payload(
+        payload, capability=capability, reasoning_effort="low", reasoning_summary=summary,
+    )
+    assert "summary" not in payload["reasoning"]
+    assert "reasoning.encrypted_content" in payload["include"]
+
+
 def test_set_reasoning_payload_custom_effort_is_preserved():
     payload: dict = {}
     _set_reasoning_payload(payload, "future-Effort")

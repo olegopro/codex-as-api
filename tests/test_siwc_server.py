@@ -406,14 +406,15 @@ def test_siwc_factory_keeps_the_selected_backend(monkeypatch):
 
 
 @pytest.mark.parametrize("args", [["login"], ["status"], ["--auth-path", "synthetic.json", "status"]])
-def test_siwc_cli_dispatch_does_not_start_server(monkeypatch, args):
+@pytest.mark.parametrize("backend", ["siwc", "codex"])
+def test_siwc_cli_dispatch_does_not_start_server(monkeypatch, args, backend):
     import uvicorn
 
     import codex_as_api.siwc_cli as siwc_cli
 
     calls = []
-    monkeypatch.setattr(server, "BACKEND", "siwc")
-    monkeypatch.setattr(siwc_cli, "main", lambda argv: calls.append(argv) or 7)
+    monkeypatch.setattr(server, "BACKEND", backend)
+    monkeypatch.setattr(siwc_cli, "main", lambda argv, *, backend: calls.append((argv, backend)) or 7)
 
     def forbidden(*_args, **_kwargs):
         pytest.fail("Запуск сервера при login/status недопустим")
@@ -421,7 +422,7 @@ def test_siwc_cli_dispatch_does_not_start_server(monkeypatch, args):
     monkeypatch.setattr(uvicorn, "run", forbidden)
     monkeypatch.setattr(server, "_get_provider", forbidden)
     assert server.main(args) == 7
-    assert calls == [args]
+    assert calls == [(args, backend)]
 
 
 def test_siwc_browser_manager_uses_public_auth_factory(monkeypatch):

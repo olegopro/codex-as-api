@@ -15,6 +15,25 @@
 | `codex` — по умолчанию | существующий standalone Codex OAuth upstream | ChatGPT Codex backend |
 | `siwc` — явно | собственная регистрация и direct ChatGPT-plan grant | `https://api.openai.com/v1` |
 
+Оба профиля используют одну актуальную Python-сборку: переводчик, инструменты,
+внешний WebSearch и диагностика общие. Старый пакет 0.9.6 для `codex` не требуется.
+Команды `login`, `status` и `preflight` работают с выбранным профилем. Для отдельной
+авторизации Legacy до входа задаются:
+
+```sh
+export CODEX_AS_API_BACKEND=codex
+export CODEX_AS_API_AUTH_PATH="$HOME/.codex-as-api/legacy/auth.json"
+.venv/bin/codex-as-api login --open-browser
+```
+
+При явно заданном auth-файле native `~/.codex/auth.json` не используется.
+У `/health` обоих профилей проверяются `backend`, `upstream_base_url`,
+`upstream_transport` и `package_revision` запущенного процесса.
+Для Anthropic-запросов Legacy по умолчанию используется полный Responses:
+он сохраняет принудительные и параллельные инструменты и параметры изображений.
+`thinking.display=omitted` отключает сводку локально; недопустимое upstream
+значение `reasoning.summary=none` не отправляется. Зашифрованное рассуждение сохраняется.
+
 Профиль `siwc` **не использует API key или API-кредиты** и не переходит на них
 при ошибке. Credentials другого OAuth-клиента не импортируются. TypeScript и Rust
 в этой ветке не получают SIWC-поддержку автоматически: адаптация относится к Python.

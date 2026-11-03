@@ -8,6 +8,30 @@ from codex_as_api import siwc_cli
 from codex_as_api.auth import ChatGPTOAuthMissingError
 
 
+def test_legacy_status_reads_only_its_explicit_credentials(monkeypatch, capsys):
+    paths = []
+    monkeypatch.setattr(siwc_cli.auth, "load_token_data",
+                        lambda path: paths.append(path) or SimpleNamespace(expired=False))
+    assert siwc_cli.main(["status", "--auth-path", "legacy.json"], backend="codex") == 0
+    assert paths == ["legacy.json"]
+    assert '"oauth_profile": "codex"' in capsys.readouterr().out
+
+
+def test_legacy_preflight_uses_classic_provider(monkeypatch, capsys):
+    import codex_as_api.provider as provider_module
+
+    calls = []
+    def factory(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex",
+            get_model_catalog=lambda: SimpleNamespace(models=(1,), model=lambda slug: SimpleNamespace(slug=slug)))
+    monkeypatch.setattr(provider_module, "ChatGPTOAuthProvider", factory)
+    assert siwc_cli.main(["preflight", "--auth-path", "legacy.json"], backend="codex") == 0
+    assert calls[0]["backend"] == "codex"
+    assert calls[0]["auth_json_path"] == "legacy.json"
+    assert '"backend": "codex"' in capsys.readouterr().out
+
+
 def test_status_is_local_even_when_login_is_required(monkeypatch, capsys):
     monkeypatch.setattr(siwc_cli.siwc_auth, "read_status", lambda path: {"state": "login_required"})
     monkeypatch.setattr(siwc_cli, "_preflight", lambda path: pytest.fail("Status вызвал сеть"))

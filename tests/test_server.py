@@ -248,6 +248,7 @@ def test_health_returns_ok(client):
         "reasoning_effort",
         "context_window",
         "auto_compact_token_limit",
+        "backend", "upstream_base_url", "upstream_transport", "package_revision",
     }
 
 
@@ -5349,14 +5350,17 @@ def test_anthropic_tool_choice_maps_parallel_control_to_provider(
     assert request_body["parallel_tool_calls"] is expected_parallel_tool_calls
 
 
-def test_anthropic_parallel_tool_choice_rejects_lite_before_upstream(
+@pytest.mark.parametrize("explicit_lite", [False, True])
+def test_anthropic_parallel_tool_choice_uses_full_unless_lite_is_explicit(
     client,
     recording_backend: RecordingBackend,
+    explicit_lite,
 ):
     response = client.post(
         "/v1/messages",
         json={
             "model": "gpt-5.6-sol",
+            **({"responses_lite": True} if explicit_lite else {}),
             "max_tokens": 1024,
             "system": "system",
             "messages": [{"role": "user", "content": "hello"}],
@@ -5367,9 +5371,13 @@ def test_anthropic_parallel_tool_choice_rejects_lite_before_upstream(
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
-    assert recording_backend.requests.empty()
+    if explicit_lite:
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+        assert recording_backend.requests.empty()
+    else:
+        assert response.status_code == 200
+        assert recording_backend.requests.get(timeout=1)["body"]["parallel_tool_calls"] is True
 
 
 def test_anthropic_messages_uses_session_cache_affinity_without_codex_metadata(
@@ -5724,7 +5732,7 @@ def test_anthropic_latest_claude_code_shape_routes_known_gpt_effort_and_fast_mod
     outbound = recording_backend.requests.get(timeout=1)["body"]
     assert outbound["model"] == "gpt-5.6-sol"
     assert outbound["reasoning"]["effort"] == "max"
-    assert outbound["reasoning"]["summary"] == "none"
+    assert "summary" not in outbound["reasoning"]
     assert outbound["service_tier"] == "priority"
     assert "output_config" not in outbound
     assert "context_management" not in outbound
@@ -5753,7 +5761,7 @@ def test_anthropic_disabled_thinking_falls_back_to_lowest_catalog_effort_while_e
 
     assert response.status_code == 200, response.text
     outbound = recording_backend.requests.get(timeout=1)["body"]
-    assert outbound["reasoning"] == {"effort": "low", "summary": "none"}
+    assert outbound["reasoning"] == {"effort": "low"}
 
     compact_resp = client.post(
         "/v1/messages/compact",
@@ -5767,7 +5775,7 @@ def test_anthropic_disabled_thinking_falls_back_to_lowest_catalog_effort_while_e
     assert compact_resp.status_code == 200, compact_resp.text
     compact_outbound = recording_backend.requests.get(timeout=1)["body"]
     assert compact_outbound["reasoning"]["effort"] == "low"
-    assert compact_outbound["reasoning"]["summary"] == "none"
+    assert "summary" not in compact_outbound["reasoning"]
 
     for explicit_payload in (
         {"reasoning_effort": "none"},
@@ -6137,7 +6145,7 @@ def test_anthropic_messages_thinking_display_summarized_vs_omitted_and_replay(
     assert stream_omitted.status_code == 200
     assert '"type": "thinking_delta"' not in stream_omitted.text
     assert '"type": "codex_reasoning_delta"' not in stream_omitted.text
-    assert captured_summaries == ["auto", "none", "auto", "none"]
+    assert captured_summaries == ["auto", None, "auto", None]
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -6167,7 +6175,7 @@ def test_anthropic_updates_passes_without_400_and_requests_no_summary(client, mo
     response = client.post("/v1/messages", json=body)
     assert response.status_code == 200, response.text
     assert "updates answer" in response.text and 'event: error' not in response.text
-    assert summaries == ["none"]
+    assert summaries == [None]
 
 
 @pytest.mark.parametrize(

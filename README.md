@@ -3,6 +3,8 @@
 > Ветка `siwc-oauth`: дополнительный Python-профиль официального подписочного
 > OAuth → public Responses API. Инструкция, ограничения preview и отдельная
 > авторизация описаны в [SIWC.md](SIWC.md). Режим upstream по умолчанию сохранён.
+> Оба Python-профиля используют текущие переводчик, WebSearch и диагностику;
+> `login/status/preflight` выбирают OAuth-профиль через `CODEX_AS_API_BACKEND`.
 
 [![GitHub Release](https://img.shields.io/github/v/release/Eunho-J/codex-as-api)](https://github.com/Eunho-J/codex-as-api/releases)
 [![PyPI](https://img.shields.io/pypi/v/codex-as-api)](https://pypi.org/project/codex-as-api/)

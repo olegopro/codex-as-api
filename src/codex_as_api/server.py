@@ -1956,7 +1956,11 @@ _RUNNING_PACKAGE_REVISION = _package_revision()
 
 def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
     if getattr(provider, "backend", BACKEND) != "siwc":
-        return {}
+        base_url = getattr(provider, "base_url", None)
+        if not isinstance(base_url, str):
+            return {}
+        return {"backend": "codex", "upstream_base_url": base_url,
+                "upstream_transport": "http", "package_revision": _RUNNING_PACKAGE_REVISION}
     return {
         "backend": "siwc",
         "upstream_base_url": SIWC_BASE_URL,
@@ -2766,7 +2770,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             status_code=400,
             content=format_anthropic_error(400, "stream must be a boolean"),
         )
-    responses_lite = body.get("responses_lite")
+    # Anthropic-клиенту нужен полный контракт: forced tools, parallel и image detail.
+    responses_lite = body.get("responses_lite", False if getattr(provider, "backend", BACKEND) == "codex" else None)
     client_model = body.get("model")
     if not isinstance(client_model, str) or not client_model:
         return JSONResponse(
@@ -3153,9 +3158,9 @@ async def compact(request: Request) -> JSONResponse:
 
 def main(argv: list[str] | None = None) -> int | None:
     args = list(sys.argv[1:] if argv is None else argv)
-    if BACKEND == "siwc" and args:
+    if args:
         from .siwc_cli import main as siwc_main
-        return siwc_main(args)
+        return siwc_main(args, backend=BACKEND)
 
     import uvicorn
 
