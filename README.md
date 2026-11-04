@@ -450,6 +450,35 @@ responses do not expose the Chat-only `response_id`. The custom
 The Anthropic type permits `cache_control: null`; the proxy treats that exact
 value as omission. A non-null cache-control object is validated in full for every client.
 
+### Opt-in cache diagnostics (Python)
+
+Set `CODEX_AS_API_DIAGNOSTICS=1` and `CODEX_AS_API_DIAGNOSTICS_PATH` to an
+absolute local file path before starting the gateway. Diagnostics do not add
+requests, retries, cache controls, or generation parameters.
+
+For both Codex/Legacy and SIWC, inference SSE observation records
+`cache_request` fingerprints of instructions, tools, cache key, settings, and
+the input prefix at every item boundary. `cache_response` records final
+upstream token usage when available, model/tier fingerprints, and an opaque
+response ID. Missing or invalid usage is marked `usage_available: false`,
+never inferred as zero. Count only completed `cache_response` events with
+valid usage; SIWC's existing `upstream_completed` events describe the same
+responses and must not be added again.
+
+HTTP requests additionally record exact body and routing-header fingerprints,
+attempt numbers, status, and an opaque `x-request-id` when supplied. SIWC
+WebSocket records fingerprint the actual `response.create` message and link
+it to the existing channel/reuse events. Correlate by `process_id`, `http_id`,
+and `payload_hash`; attempt IDs identify their respective observation layers.
+The custom compaction JSON endpoint is outside this inference observation.
+
+Prompt text, tool arguments, encrypted reasoning, credentials, and raw account
+or session identifiers are not logged. Local files have mode `0600`, rotate
+at 5 MiB, and retain up to seven days within a 256 MiB total cap. A capacity
+warning means that seven-day coverage is incomplete. These records detect
+observable request changes; they cannot reveal an upstream cache eviction or
+routing decision, guarantee a cache hit, or measure subscription quota charges.
+
 ### `POST /v1/messages/count_tokens`
 
 Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route counts text locally and returns context-window metadata for the effective backend model. Normalized model-visible messages, tool calls, tool-result metadata, reasoning, and tool schemas are counted once. Request-envelope fields and the `max_tokens` compatibility hint are excluded; other unsupported generation controls fail instead of becoming no-ops. Image inputs use a separate fixed estimate so inline base64 data is not counted as text.

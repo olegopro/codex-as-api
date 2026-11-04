@@ -25,7 +25,7 @@ from typing import Any, NoReturn, cast
 
 import httpx
 
-from . import __version__
+from . import __version__, cache_diagnostics
 from .auth import (
     ChatGPTOAuthCatalogUnavailableError,
     ChatGPTOAuthError,
@@ -1835,11 +1835,10 @@ class ChatGPTOAuthProvider:
     ) -> Iterator[dict[str, Any]]:
         if catalog_key is None:
             catalog_key = getattr(extra_headers, "catalog_key", None)
-        yield from self._request_sse(
-            path,
-            payload,
-            extra_headers=extra_headers,
-            catalog_key=catalog_key,
+        yield from cache_diagnostics.observe_events(
+            self._request_sse(path, payload, extra_headers=extra_headers, catalog_key=catalog_key),
+            payload, backend=self.backend,
+            transport="websocket" if self.backend == "siwc" and self.siwc_transport == "websocket" else "http",
         )
 
     def _request_sse(
@@ -1906,8 +1905,11 @@ class ChatGPTOAuthProvider:
                 method="POST",
             )
             error_deadline = time.monotonic() + self.timeout
+            cache_diagnostics.http_request(payload, dict(req.header_items()), cast(bytes, req.data), attempt)
             try:
                 with self._open_request(req, timeout=self.timeout, cancel=cancel) as response:
+                    cache_diagnostics.http_response(payload, getattr(response, "status", None),
+                                                    getattr(response, "headers", None), attempt)
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,
@@ -1956,6 +1958,7 @@ class ChatGPTOAuthProvider:
                         with self._active_response_lock:
                             self._active_responses.discard(response)
             except urllib.error.HTTPError as exc:
+                cache_diagnostics.http_response(payload, exc.code, exc.headers, attempt)
                 if exc.code == 401 and attempt == 0:
                     exc.close()
                     self._refresh_after_unauthorized(token)

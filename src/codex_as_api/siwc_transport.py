@@ -21,6 +21,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.protocol import State
 from websockets.sync.client import connect
 
+from . import cache_diagnostics
 from .auth import ChatGPTOAuthProtocolError, ChatGPTOAuthUpstreamError
 from .diagnostics import current as diagnostic_context
 from .diagnostics import emit as diagnostic_emit
@@ -288,7 +289,10 @@ class SIWCWebSocketPool:
                     with cancel.bind(stop) if cancel is not None else nullcontext():
                         wire = {k: v for k, v in payload.items() if k != "stream"}
                         wire["type"] = "response.create"
-                        socket.send(json.dumps(wire))
+                        body = json.dumps(wire)
+                        cache_diagnostics.websocket_request(payload, body, account_id=account_id,
+                                                            attempt_id=request_id, channel_id=entry.channel_id)
+                        socket.send(body)
                         completed = False
                         try:
                             while True:

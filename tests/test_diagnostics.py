@@ -11,8 +11,9 @@ import anyio
 import pytest
 from fastapi.testclient import TestClient
 
-from codex_as_api import diagnostics, server, siwc_transport
+from codex_as_api import cache_diagnostics, diagnostics, server, siwc_transport
 from codex_as_api.auth import ChatGPTOAuthInvalidRequestError
+from codex_as_api.provider import ChatGPTOAuthProvider
 from codex_as_api.siwc_transport import SIWCWebSocketPool
 
 from .test_siwc_websocket import FakeSocket
@@ -439,3 +440,195 @@ def test_terminal_failure_is_not_success(diagnostic_log, failure):
     assert stages[-1] == {"failed": "http_error", "incomplete": "http_error", "disconnect": "http_disconnected",
                           "exception": "http_error"}[failure]
     assert "upstream-error-canary" not in diagnostic_log.read_text()
+
+
+@pytest.mark.parametrize("backend,transport", [("codex", "http"), ("siwc", "http"), ("siwc", "websocket")])
+def test_cache_transport_observation_preserves_events_and_payload(diagnostic_log, monkeypatch, backend, transport):
+    provider = object.__new__(ChatGPTOAuthProvider)
+    provider.backend = backend
+    provider.siwc_transport = transport
+    payload = {"model": "gpt-6.1-terra", "instructions": "instructions-canary",
+               "input": [{"role": "user", "content": "prompt-canary"}],
+               "tools": [{"name": "tool-canary"}], "prompt_cache_key": "key-canary"}
+    headers = {"Authorization": "auth-canary"}
+    events = [{"type": "response.output_text.delta", "delta": "output-canary"},
+              {"type": "response.completed", "response": {"id": "resp_test123", "model": "gpt-6.1-terra",
+               "service_tier": "default", "usage": {"input_tokens": 2000, "output_tokens": 10,
+               "input_tokens_details": {"cached_tokens": 1920}}}}]
+    observed = []
+
+    def request(path, body, **kwargs):
+        assert path == "/responses" and body is payload and kwargs["extra_headers"] is headers
+        for event in events:
+            observed.append(event)
+            yield event
+
+    monkeypatch.setattr(provider, "_request_sse", request)
+    iterator = provider._post_sse("/responses", payload, extra_headers=headers)
+    assert next(iterator) is events[0] and len(observed) == 1
+    assert list(iterator) == events[1:]
+    data = records(diagnostic_log)
+    assert [r["stage"] for r in data] == ["cache_request", "cache_response"]
+    start, finish = data
+    assert start["backend"] == backend and start["transport"] == transport
+    assert finish["attempt_id"] == start["attempt_id"]
+    assert finish["payload_hash"] == start["payload_hash"]
+    assert finish["cached_tokens"] == 1920 and finish["usage_available"] is True
+    assert finish["upstream_response_id"] == "resp_test123"
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_cache_prefixes_preserve_history_and_detect_early_edits(diagnostic_log):
+    payload = {"model": "gpt-6-luna", "input": [{"role": "user", "content": "one-canary"}],
+               "tools": [{"name": "Read"}], "reasoning": {"effort": "low"}}
+    list(cache_diagnostics.observe_events(iter([]), payload, backend="codex", transport="http"))
+    payload["input"].append({"role": "developer", "content": "late-note-canary"})
+    list(cache_diagnostics.observe_events(iter([]), payload, backend="codex", transport="http"))
+    payload["input"][0]["content"] = "changed-canary"
+    payload["reasoning"]["effort"] = "high"
+    list(cache_diagnostics.observe_events(iter([]), payload, backend="codex", transport="http"))
+    starts = [r for r in records(diagnostic_log) if r["stage"] == "cache_request"]
+    assert starts[0]["input_prefix_hashes"] == starts[1]["input_prefix_hashes"][:1]
+    assert starts[2]["input_prefix_hashes"][0] != starts[1]["input_prefix_hashes"][0]
+    assert starts[0]["settings_hash"] == starts[1]["settings_hash"] != starts[2]["settings_hash"]
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_cache_observation_disabled_skips_fingerprints(monkeypatch):
+    monkeypatch.setattr(diagnostics, "_LOG", None)
+
+    def fail(_):
+        raise AssertionError("disabled diagnostics must not fingerprint payloads")
+
+    monkeypatch.setattr(cache_diagnostics, "_hash", fail)
+    event = {"type": "response.completed"}
+    assert list(cache_diagnostics.observe_events(iter([event]), {}, backend="codex", transport="http")) == [event]
+
+
+@pytest.mark.parametrize("mode,expected", [("close", "interrupted"), ("error", "upstream_error"),
+                                          ("end", "upstream_incomplete"), ("no_usage", "completed")])
+def test_cache_observation_does_not_invent_zero_usage(diagnostic_log, mode, expected):
+    def events():
+        yield {"type": "response.created"}
+        if mode == "error":
+            raise RuntimeError("error-canary")
+        if mode == "no_usage":
+            yield {"type": "response.completed", "response": {}}
+
+    iterator = cache_diagnostics.observe_events(events(), {}, backend="codex", transport="http")
+    next(iterator)
+    if mode == "close":
+        iterator.close()
+    elif mode == "error":
+        with pytest.raises(RuntimeError, match="error-canary"):
+            list(iterator)
+    else:
+        list(iterator)
+    finish = records(diagnostic_log)[-1]
+    assert finish["reason"] == expected and finish["usage_available"] is False
+    assert "cached_tokens" not in finish
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_cache_http_fingerprints_final_headers_without_credentials(diagnostic_log):
+    payload = {"input": "prompt-canary"}
+    headers = {"Authorization": "auth-canary", "Cookie": "cookie-canary", "session-id": "session-canary",
+               "thread-id": "thread-canary", "ChatGPT-Account-ID": "account-canary"}
+    cache_diagnostics.http_request(payload, headers, b"wire-body-canary", 0)
+    headers["Authorization"] = "new-auth-canary"
+    cache_diagnostics.http_request(payload, headers, b"wire-body-canary", 1)
+    headers["thread-id"] = "new-thread-canary"
+    cache_diagnostics.http_request(payload, headers, b"wire-body-canary", 0)
+    cache_diagnostics.http_response(payload, 200, {"x-request-id": "req_test123"}, 0)
+    a, b, c, response = records(diagnostic_log)
+    assert a["routing_hash"] == b["routing_hash"] != c["routing_hash"]
+    assert a["session_header_hash"] == b["session_header_hash"] == c["session_header_hash"]
+    assert a["thread_header_hash"] != c["thread_header_hash"]
+    assert response["upstream_request_id"] == "req_test123" and response["status"] == 200
+    assert "canary" not in diagnostic_log.read_text()
+
+
+@pytest.mark.parametrize("backend", ["codex", "siwc"])
+def test_cache_http_real_provider_boundary(diagnostic_log, monkeypatch, backend):
+    from .test_provider import _BufferedUpstreamResponse, _test_token
+
+    provider = ChatGPTOAuthProvider(backend=backend, siwc_transport="http")
+    payload = {"model": "gpt-6.1-terra", "store": False, "stream": True,
+               "prompt_cache_key": "session-canary",
+               "input": [{"type": "message", "role": "user", "content": "prompt-canary"}]}
+    response = _BufferedUpstreamResponse(b'data: {"type":"response.completed","response":{}}\n\n')
+    response.headers = {"x-request-id": "req_boundary123"}
+    response.status = 200
+    captured = []
+
+    def open_request(request, **kwargs):
+        assert request.data == json.dumps(payload).encode("utf-8")
+        captured.append(request)
+        return response
+
+    token = _test_token()
+    token.oauth_profile = backend
+    monkeypatch.setattr(provider, "_token_for_request", lambda: token)
+    monkeypatch.setattr(provider, "_open_request", open_request)
+    try:
+        assert list(provider._post_sse("/responses", payload)) == [
+            {"type": "response.completed", "response": {}}
+        ]
+    finally:
+        provider.close()
+    data = records(diagnostic_log)
+    assert len(captured) == 1
+    assert [r["stage"] for r in data] == [
+        "cache_request", "cache_http_request", "cache_http_response", "cache_response"
+    ]
+    assert len({r["payload_hash"] for r in data}) == 1
+    assert data[2]["status"] == 200 and data[2]["upstream_request_id"] == "req_boundary123"
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_cache_observation_forwards_close_and_handles_json_surrogates(diagnostic_log):
+    closed = []
+
+    def events():
+        try:
+            yield {"type": "response.created"}
+        finally:
+            closed.append(True)
+
+    upstream = events()
+    iterator = cache_diagnostics.observe_events(
+        upstream, {"input": [{"role": "user", "content": "\ud800"}]}, backend="codex", transport="http",
+    )
+    next(iterator)
+    iterator.close()
+    assert closed == [True]
+    assert records(diagnostic_log)[-1]["reason"] == "interrupted"
+
+
+def test_cache_websocket_fingerprints_actual_wire_and_channel(diagnostic_log, monkeypatch):
+    import hashlib
+
+    sock = FakeSocket([{"type": "response.completed", "response": {"output": []}}])
+    sent = []
+
+    def send(body):
+        sent.append(body)
+        FakeSocket.send(sock, body)
+
+    monkeypatch.setattr(sock, "send", send)
+    monkeypatch.setattr(siwc_transport, "connect", lambda *a, **kw: sock)
+    payload = {"model": "gpt-6-luna", "stream": True, "store": False,
+               "input": [{"role": "user", "content": "prompt-canary"}]}
+    pool = SIWCWebSocketPool()
+    try:
+        list(pool.events(payload, account_id="account-canary", access_token="auth-canary", timeout=1))
+    finally:
+        pool.close()
+    expected = {k: v for k, v in payload.items() if k != "stream"}
+    expected["type"] = "response.create"
+    assert sent == [json.dumps(expected)]
+    wire = next(r for r in records(diagnostic_log) if r["stage"] == "cache_websocket_request")
+    assert wire["wire_hash"] == hashlib.sha256(sent[0].encode()).hexdigest()[:32]
+    assert any(r.get("attempt_id") == wire["attempt_id"] and r.get("channel_id") == wire["channel_id"]
+               and r["stage"] == "upstream_start" for r in records(diagnostic_log))
+    assert "canary" not in diagnostic_log.read_text()

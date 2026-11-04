@@ -166,7 +166,10 @@ _ENUMS = {
     "stage": {"http_start", "validation_error", "http_start_response", "http_stream_finished", "http_error",
               "http_cancelled", "http_disconnected", "upstream_start", "upstream_completed", "upstream_error",
               "request_metadata", "channel_selected", "output_key", "channel_released", "cancel_requested",
-              "search_start", "search_completed", "search_error"},
+              "search_start", "search_completed", "search_error", "cache_request", "cache_response",
+              "cache_http_request", "cache_http_response", "cache_websocket_request"},
+    "backend": {"codex", "siwc"},
+    "transport": {"http", "websocket"},
     "reason": {"invalid_json", "invalid_content_type", "body_too_large", "invalid_request", "thinking_display_invalid",
                "no_socket", "socket_closed", "credentials_changed", "connection_expired", "reused", "upstream_failed",
                "upstream_incomplete", "upstream_error", "interrupted", "stream_error", "completed",
@@ -184,8 +187,14 @@ _ENUMS = {
 }
 _NUMBERS = {"status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_tokens", "cached_tokens",
             "output_tokens", "total_tokens", "message_count", "tool_count", "content_items", "body_bytes",
-            "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests"}
-_IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id"}
+            "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests",
+            "network_attempt"}
+_IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
+                "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
+                "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
+                "actual_model_hash", "service_tier_hash"}
+_UPSTREAM_IDS = {"upstream_request_id": re.compile(r"(?:req_[A-Za-z0-9_-]{1,160}|[0-9a-f-]{32,36})\Z"),
+                 "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z")}
 _PROCESS_ID = uuid.uuid4().hex
 
 
@@ -216,7 +225,11 @@ def emit(stage: str, **fields: Any) -> None:
             or (key in _NUMBERS and isinstance(value, int) and not isinstance(value, bool) and value >= 0)
             or (key in _IDENTIFIERS and isinstance(value, str) and len(value) in {12, 32}
                 and all(char in "0123456789abcdef" for char in value))
-            or (key in {"reused", "stream"} and isinstance(value, bool))
+            or (key in {"reused", "stream", "usage_available"} and isinstance(value, bool))
+            or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
+            or (key == "input_prefix_hashes" and isinstance(value, list)
+                and all(isinstance(v, str) and len(v) == 32 and all(c in "0123456789abcdef" for c in v)
+                        for v in value))
         ):
             record[key] = value
     _LOG.info(json.dumps(record, separators=(",", ":")))
