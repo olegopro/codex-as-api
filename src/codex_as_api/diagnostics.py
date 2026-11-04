@@ -167,7 +167,7 @@ _ENUMS = {
               "http_cancelled", "http_disconnected", "upstream_start", "upstream_completed", "upstream_error",
               "request_metadata", "channel_selected", "output_key", "channel_released", "cancel_requested",
               "search_start", "search_completed", "search_error", "cache_request", "cache_response",
-              "cache_http_request", "cache_http_response", "cache_websocket_request"},
+              "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request"},
     "backend": {"codex", "siwc"},
     "transport": {"http", "websocket"},
     "reason": {"invalid_json", "invalid_content_type", "body_too_large", "invalid_request", "thinking_display_invalid",
@@ -192,7 +192,8 @@ _NUMBERS = {"status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_t
 _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
                 "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
-                "actual_model_hash", "service_tier_hash"}
+                "actual_model_hash", "service_tier_hash", "client_instructions_hash", "client_tools_hash",
+                "client_model_hash", "client_settings_hash"}
 _UPSTREAM_IDS = {"upstream_request_id": re.compile(r"(?:req_[A-Za-z0-9_-]{1,160}|[0-9a-f-]{32,36})\Z"),
                  "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z")}
 _PROCESS_ID = uuid.uuid4().hex
@@ -227,7 +228,7 @@ def emit(stage: str, **fields: Any) -> None:
                 and all(char in "0123456789abcdef" for char in value))
             or (key in {"reused", "stream", "usage_available"} and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
-            or (key == "input_prefix_hashes" and isinstance(value, list)
+            or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)
                 and all(isinstance(v, str) and len(v) == 32 and all(c in "0123456789abcdef" for c in v)
                         for v in value))
         ):

@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.datastructures import Headers
 
+from . import cache_diagnostics
 from .anthropic_adapter import (
     anthropic_parallel_tool_calls,
     anthropic_request_to_internal,
@@ -2637,6 +2638,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     provider = _get_provider()
     try:
         body = await _request_json_object(http_request)
+        cache_diagnostics.client_request(body, http_request.headers)
         _reject_explicit_null_responses_lite(body)
         _reject_unknown_fields(body, _ANTHROPIC_MESSAGES_FIELDS)
         _reject_explicit_null_anthropic_fields(body)

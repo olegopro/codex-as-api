@@ -632,3 +632,61 @@ def test_cache_websocket_fingerprints_actual_wire_and_channel(diagnostic_log, mo
     assert any(r.get("attempt_id") == wire["attempt_id"] and r.get("channel_id") == wire["channel_id"]
                and r["stage"] == "upstream_start" for r in records(diagnostic_log))
     assert "canary" not in diagnostic_log.read_text()
+
+
+def test_client_cache_fingerprints_preserve_body_and_detect_input_changes(diagnostic_log):
+    payload = {"model": "model-canary", "system": "system-canary", "max_tokens": 10,
+               "tools": [{"name": "tool-canary"}],
+               "messages": [{"role": "user", "content": "prompt-canary"}]}
+    original = json.dumps(payload)
+    cache_diagnostics.client_request(payload)
+    assert json.dumps(payload) == original
+    payload["messages"].append({"role": "assistant", "content": "output-canary"})
+    cache_diagnostics.client_request(payload)
+    payload["messages"][0]["content"] = "changed-canary"
+    cache_diagnostics.client_request(payload)
+    a, b, c = records(diagnostic_log)
+    assert a["client_prefix_hashes"] == b["client_prefix_hashes"][:1]
+    assert c["client_prefix_hashes"][0] != b["client_prefix_hashes"][0]
+    assert a["client_instructions_hash"] == b["client_instructions_hash"]
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_client_cache_disabled_does_not_fingerprint(monkeypatch):
+    monkeypatch.setattr(diagnostics, "_LOG", None)
+    monkeypatch.setattr(cache_diagnostics, "_hash", lambda _: pytest.fail("unexpected fingerprint"))
+    cache_diagnostics.client_request({"messages": []})
+
+
+def test_client_cache_only_fingerprints_headers_used_for_translation(diagnostic_log):
+    payload = {"messages": []}
+    headers = {"x-openai-subagent": "first-canary", "authorization": "auth-canary"}
+    cache_diagnostics.client_request(payload, headers)
+    headers["x-openai-subagent"] = "second-canary"
+    cache_diagnostics.client_request(payload, headers)
+    headers["authorization"] = "changed-auth-canary"
+    cache_diagnostics.client_request(payload, headers)
+    a, b, c = records(diagnostic_log)
+    assert a["client_settings_hash"] != b["client_settings_hash"]
+    assert b["client_settings_hash"] == c["client_settings_hash"]
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_client_cache_capture_precedes_adapter_mutation(diagnostic_log, monkeypatch):
+    monkeypatch.setattr(server, "_get_provider", lambda: object())
+
+    def strip(body):
+        assert any(r["stage"] == "client_cache_request" for r in records(diagnostic_log))
+        body["system"][0].pop("cache_control")
+        raise ChatGPTOAuthInvalidRequestError("stop before model")
+
+    monkeypatch.setattr(server, "_strip_anthropic_cache_controls", strip)
+    payload = {"model": "gpt-6.1-terra", "max_tokens": 10,
+               "system": [{"type": "text", "text": "system-canary", "cache_control": {"type": "ephemeral"}}],
+               "messages": [{"role": "user", "content": "prompt-canary"}]}
+    response = TestClient(server.app).post("/v1/messages", json=payload)
+    assert response.status_code == 400
+    client = next(r for r in records(diagnostic_log) if r["stage"] == "client_cache_request")
+    cache_diagnostics.client_request(payload)
+    assert client["client_instructions_hash"] == records(diagnostic_log)[-1]["client_instructions_hash"]
+    assert "http_id" in client and "canary" not in diagnostic_log.read_text()

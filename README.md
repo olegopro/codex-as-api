@@ -465,6 +465,15 @@ never inferred as zero. Count only completed `cache_response` events with
 valid usage; SIWC's existing `upstream_completed` events describe the same
 responses and must not be added again.
 
+The Anthropic ingress additionally records `client_cache_request` fingerprints
+of the original messages, system content, tools, requested model, and other
+settings before the adapter mutates the body. The settings hash also covers the
+three ingress headers used for session/subagent/memgen translation; authentication
+headers are excluded. Join these to the outbound and
+usage records by `process_id` and `http_id`. Comparing both layers distinguishes
+an observed client-side change from a change introduced during translation;
+neither observation alone proves a bug or reveals the server's cache decision.
+
 HTTP requests additionally record exact body and routing-header fingerprints,
 attempt numbers, status, and an opaque `x-request-id` when supplied. SIWC
 WebSocket records fingerprint the actual `response.create` message and link

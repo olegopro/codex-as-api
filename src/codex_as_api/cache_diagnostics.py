@@ -32,6 +32,22 @@ def _prefixes(value: Any) -> list[str]:
     return result
 
 
+def client_request(payload: dict[str, Any], headers: Mapping[str, str] | None = None) -> None:
+    if diagnostics.enabled():
+        headers = headers or {}
+        diagnostics.emit(
+            "client_cache_request", client_prefix_hashes=_prefixes(payload.get("messages", [])),
+            client_instructions_hash=_hash(payload.get("system")), client_tools_hash=_hash(payload.get("tools")),
+            client_model_hash=_hash(payload.get("model")),
+            client_settings_hash=_hash({
+                "body": {k: v for k, v in payload.items() if k not in {"messages", "system", "tools", "model"}},
+                "headers": {k: headers.get(k) for k in (
+                    "x-claude-code-session-id", "x-openai-subagent", "x-openai-memgen-request",
+                )},
+            }),
+        )
+
+
 def observe_events(
     events: Iterator[dict[str, Any]], payload: dict[str, Any], *, backend: str, transport: str,
 ) -> Iterator[dict[str, Any]]:
