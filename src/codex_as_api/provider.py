@@ -1694,7 +1694,7 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthInvalidRequestError("max_tokens is not supported by the ChatGPT Codex OAuth transport")
         _reject_unsupported_stop(stop)
         instructions, input_items = _split_instructions_and_input(
-            messages, preserve_system_positions=self.backend == "siwc",
+            messages, preserve_system_positions=True,
         )
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
@@ -1702,7 +1702,7 @@ class ChatGPTOAuthProvider:
             instructions, input_items = _split_instructions_and_input(
                 messages,
                 backend_model=request_model,
-                preserve_system_positions=self.backend == "siwc",
+                preserve_system_positions=True,
             )
         if previous_response_id is not None:
             validated_previous_response_id = _validate_previous_response_id(previous_response_id)
@@ -2708,7 +2708,7 @@ def _split_instructions_and_input(
             ):
                 _reject_prompt_cache_breakpoint(None)
             if preserve_system_positions and input_messages:
-                # Claude Code adds live token-budget notes after tool results.
+                # Claude Code adds environment, task and budget notes after tool results.
                 # Hoisting them into instructions changes the entire cached prefix.
                 input_messages.append(replace(msg, role=MessageRole.DEVELOPER))
             else:

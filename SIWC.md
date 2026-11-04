@@ -34,6 +34,12 @@ export CODEX_AS_API_AUTH_PATH="$HOME/.codex-as-api/legacy/auth.json"
 `thinking.display=omitted` отключает сводку локально; недопустимое upstream
 значение `reasoning.summary=none` не отправляется. Зашифрованное рассуждение сохраняется.
 
+Поздние system-сообщения Claude Code в обоих профилях остаются на своём месте
+в истории как developer-items. Перенос повторяемых заметок Concise, окружения
+и фоновых задач в `instructions` сдвигает историю и теряет её кэш. Проверка только
+`cached_tokens > 0` недостаточна: на трёх ходах с инструментами должны сохраняться
+начальные instructions и весь прежний input. Это проверяется также с reasoning-items.
+
 Профиль `siwc` **не использует API key или API-кредиты** и не переходит на них
 при ошибке. Credentials другого OAuth-клиента не импортируются. TypeScript и Rust
 в этой ветке не получают SIWC-поддержку автоматически: адаптация относится к Python.
