@@ -474,6 +474,21 @@ usage records by `process_id` and `http_id`. Comparing both layers distinguishes
 an observed client-side change from a change introduced during translation;
 neither observation alone proves a bug or reveals the server's cache decision.
 
+`client_cache_normalized` records the same fingerprints immediately after the
+existing Anthropic cache-control stripping step. Raw fingerprints remain
+available; the second record distinguishes marker movement from content changes
+without changing the model request. `client_cache_control_positions` contains
+only integer paths: scope 0=request, 1=system, 2=messages, 3=tools, followed by
+array indexes (nested content adds indexes). No marker values are logged.
+`fingerprint_version: 1` identifies the unchanged cumulative hash algorithm;
+older records without this field use that same algorithm.
+
+When returned by the server, `cache_response` also records write-token totals,
+30-minute/12-hour write breakdowns, applied TTL/mode/retention, and allowlisted
+cache-diagnostic type/reason. Missing counters are omitted, not inferred as zero.
+These fields observe the response only: no TTL, comparison request, cache
+breakpoint, or routing header is added to inference requests.
+
 HTTP requests additionally record exact body and routing-header fingerprints,
 attempt numbers, status, and an opaque `x-request-id` when supplied. SIWC
 WebSocket records fingerprint the actual `response.create` message and link

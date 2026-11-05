@@ -690,3 +690,93 @@ def test_client_cache_capture_precedes_adapter_mutation(diagnostic_log, monkeypa
     cache_diagnostics.client_request(payload)
     assert client["client_instructions_hash"] == records(diagnostic_log)[-1]["client_instructions_hash"]
     assert "http_id" in client and "canary" not in diagnostic_log.read_text()
+
+
+def test_raw_and_normalized_client_fingerprints_distinguish_moving_cache_controls(diagnostic_log):
+    from copy import deepcopy
+
+    payload = {"model": "model-canary", "system": [{"type": "text", "text": "system-canary"}],
+               "tools": [{"name": "tool-canary",
+                          "input_schema": {"properties": {"cache_control": {"type": "string"}}}}],
+               "messages": [{"role": "user", "content": [{"type": "text", "text": "first-canary"},
+                             {"type": "tool_result", "tool_use_id": "tool-canary",
+                              "content": [{"type": "text", "text": "nested-canary"}]}]}]}
+    first = deepcopy(payload)
+    first["system"][0]["cache_control"] = {"type": "ephemeral"}
+    first["messages"][0]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    first["messages"][0]["content"][1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+    first["tools"][0]["cache_control"] = {"type": "ephemeral"}
+    original = deepcopy(first)
+    cache_diagnostics.client_request(first)
+    assert first == original
+    server._strip_anthropic_cache_controls(first)
+    cache_diagnostics.client_request(first, normalized=True)
+    second = deepcopy(payload)
+    second["messages"][0]["content"][1]["cache_control"] = {"type": "ephemeral"}
+    cache_diagnostics.client_request(second)
+    server._strip_anthropic_cache_controls(second)
+    cache_diagnostics.client_request(second, normalized=True)
+    raw_a, norm_a, raw_b, norm_b = records(diagnostic_log)
+    assert raw_a["client_cache_control_positions"] == [[1, 0], [2, 0, 0], [2, 0, 1, 0], [3, 0]]
+    assert raw_a["client_prefix_hashes"] != raw_b["client_prefix_hashes"]
+    for key in ("client_prefix_hashes", "client_instructions_hash", "client_tools_hash", "client_settings_hash"):
+        assert norm_a[key] == norm_b[key]
+    assert norm_a["stage"] == "client_cache_normalized" and norm_a["fingerprint_version"] == 1
+    assert first["tools"][0]["input_schema"]["properties"]["cache_control"] == {"type": "string"}
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_normalized_capture_happens_after_real_strip_before_translation(diagnostic_log, monkeypatch):
+    monkeypatch.setattr(server, "_get_provider", lambda: object())
+
+    def stop(body, session):
+        data = records(diagnostic_log)
+        normalized = next(r for r in data if r["stage"] == "client_cache_normalized")
+        assert "cache_control" not in body["messages"][0]["content"][0]
+        assert normalized["client_prefix_hashes"] == cache_diagnostics._prefixes(body["messages"])
+        raise ChatGPTOAuthInvalidRequestError("stop before inference")
+
+    monkeypatch.setattr(server, "_anthropic_prompt_cache_key", stop)
+    response = TestClient(server.app).post("/v1/messages", json={
+        "model": "gpt-6.1-terra", "max_tokens": 10,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "prompt-canary",
+                                                     "cache_control": {"type": "ephemeral"}}]}],
+    })
+    assert response.status_code == 400
+    assert not any(r["stage"] == "upstream_start" for r in records(diagnostic_log))
+
+
+def test_cache_observation_records_only_reported_write_counters_and_options(diagnostic_log):
+    event = {"type": "response.completed", "response": {
+        "id": "resp_writes", "model": "model-canary", "service_tier": "tier-canary",
+        "usage": {"input_tokens": 100000, "output_tokens": 10, "cache_write_input_tokens": 60000,
+                  "input_tokens_details": {"cached_tokens": 40000, "cache_write_tokens": 60000,
+                      "cache_write_tokens_details": {"ttl_30m_tokens": 30000, "ttl_12h_tokens": 30000}}},
+        "prompt_cache_options": {"ttl": "12h", "mode": "implicit", "secret": "option-canary"},
+        "prompt_cache_diagnostics": {"type": "cache_miss", "reason": "input_changed"}}}
+    assert list(cache_diagnostics.observe_events(iter([event]), {}, backend="codex", transport="http")) == [event]
+    end = records(diagnostic_log)[-1]
+    assert end["cache_write_usage_available"] is True
+    assert end["cache_write_tokens"] == end["cache_write_input_tokens"] == 60000
+    assert end["cache_write_ttl_30m_tokens"] == end["cache_write_ttl_12h_tokens"] == 30000
+    assert end["cache_ttl"] == "12h" and end["cache_mode"] == "implicit"
+    assert end["cache_diagnostic_reason"] == "input_changed"
+    assert "canary" not in diagnostic_log.read_text()
+
+
+@pytest.mark.parametrize("details", [{}, {"cache_write_tokens": True}, {"cache_write_tokens": -1},
+                                     {"cache_write_tokens": "write-canary"}])
+def test_absent_or_invalid_write_usage_never_becomes_zero(diagnostic_log, details):
+    event = {"type": "response.completed", "response": {"usage": {
+        "input_tokens": 1000, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 0, **details}}}}
+    list(cache_diagnostics.observe_events(iter([event]), {}, backend="siwc", transport="websocket"))
+    end = records(diagnostic_log)[-1]
+    assert end["usage_available"] is True and end["cache_write_usage_available"] is False
+    assert "cache_write_tokens" not in end and "cache_ttl" not in end
+
+
+def test_cache_control_position_allowlist_rejects_strings_and_malformed_paths(diagnostic_log):
+    for positions in (["position-canary"], [[[]]], [[True]], [[-1]], [[4, 1]]):
+        diagnostics.emit("client_cache_request", client_cache_control_positions=positions)
+    assert all("client_cache_control_positions" not in r for r in records(diagnostic_log))
+    assert "canary" not in diagnostic_log.read_text()

@@ -32,11 +32,44 @@ def _prefixes(value: Any) -> list[str]:
     return result
 
 
-def client_request(payload: dict[str, Any], headers: Mapping[str, str] | None = None) -> None:
+def _cache_control_positions(payload: dict[str, Any]) -> list[list[int]]:
+    # Scope codes: request=0, system=1, messages=2, tools=3. Only array indexes follow.
+    positions = [[0]] if "cache_control" in payload else []
+
+    def content(value: Any, path: list[int]) -> None:
+        if isinstance(value, list):
+            for index, block in enumerate(value):
+                if isinstance(block, dict):
+                    if "cache_control" in block:
+                        positions.append([*path, index])
+                    content(block.get("content"), [*path, index])
+
+    system = payload.get("system")
+    if isinstance(system, dict) and "cache_control" in system:
+        positions.append([1])
+    content(system, [1])
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if isinstance(message, dict):
+                content(message.get("content"), [2, index])
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for index, tool in enumerate(tools):
+            if isinstance(tool, dict) and "cache_control" in tool:
+                positions.append([3, index])
+    return positions
+
+
+def client_request(
+    payload: dict[str, Any], headers: Mapping[str, str] | None = None, *, normalized: bool = False,
+) -> None:
     if diagnostics.enabled():
         headers = headers or {}
         diagnostics.emit(
-            "client_cache_request", client_prefix_hashes=_prefixes(payload.get("messages", [])),
+            "client_cache_normalized" if normalized else "client_cache_request", fingerprint_version=1,
+            client_cache_control_positions=[] if normalized else _cache_control_positions(payload),
+            client_prefix_hashes=_prefixes(payload.get("messages", [])),
             client_instructions_hash=_hash(payload.get("system")), client_tools_hash=_hash(payload.get("tools")),
             client_model_hash=_hash(payload.get("model")),
             client_settings_hash=_hash({
@@ -46,6 +79,26 @@ def client_request(payload: dict[str, Any], headers: Mapping[str, str] | None = 
                 )},
             }),
         )
+
+
+def _response_cache_metadata(
+    response: dict[str, Any], usage: dict[str, Any], details: dict[str, Any],
+) -> dict[str, Any]:
+    writes = details.get("cache_write_tokens_details")
+    writes = writes if isinstance(writes, dict) else {}
+    fields = {"cache_write_tokens": details.get("cache_write_tokens"),
+              "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
+              "cache_write_ttl_30m_tokens": writes.get("ttl_30m_tokens"),
+              "cache_write_ttl_12h_tokens": writes.get("ttl_12h_tokens")}
+    fields = {k: v for k, v in fields.items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    options = response.get("prompt_cache_options")
+    options = options if isinstance(options, dict) else {}
+    diagnostic = response.get("prompt_cache_diagnostics")
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    return {**fields, "cache_write_usage_available": bool(fields),
+            "cache_ttl": options.get("ttl"), "cache_mode": options.get("mode"),
+            "cache_retention": response.get("prompt_cache_retention"),
+            "cache_diagnostic_type": diagnostic.get("type"), "cache_diagnostic_reason": diagnostic.get("reason")}
 
 
 def observe_events(
@@ -59,7 +112,7 @@ def observe_events(
     payload_hash = _hash(payload)
     prefixes = _prefixes(payload.get("input", []))
     diagnostics.emit(
-        "cache_request", attempt_id=attempt_id, backend=backend, transport=transport,
+        "cache_request", attempt_id=attempt_id, backend=backend, transport=transport, fingerprint_version=1,
         model=diagnostics.safe_model(payload.get("model")), payload_hash=payload_hash,
         instructions_hash=_hash(payload.get("instructions")), tools_hash=_hash(payload.get("tools")),
         cache_key_hash=_hash(payload.get("prompt_cache_key")), input_prefix_hashes=prefixes,
@@ -94,6 +147,7 @@ def observe_events(
                     upstream_response_id=response.get("id"),
                     actual_model_hash=_hash(response.get("model")),
                     service_tier_hash=_hash(response.get("service_tier")), **counts,
+                    **_response_cache_metadata(response, usage, details),
                 )
                 terminal = True
             yield event

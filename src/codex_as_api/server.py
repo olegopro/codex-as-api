@@ -2691,6 +2691,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             http_request.headers.get("x-openai-memgen-request"),
         )
         _strip_anthropic_cache_controls(body)
+        cache_diagnostics.client_request(body, http_request.headers, normalized=True)
         prompt_cache_key = _anthropic_prompt_cache_key(
             body,
             claude_session_id,

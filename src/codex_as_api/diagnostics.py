@@ -167,7 +167,15 @@ _ENUMS = {
               "http_cancelled", "http_disconnected", "upstream_start", "upstream_completed", "upstream_error",
               "request_metadata", "channel_selected", "output_key", "channel_released", "cancel_requested",
               "search_start", "search_completed", "search_error", "cache_request", "cache_response",
-              "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request"},
+              "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request",
+              "client_cache_normalized"},
+    "cache_ttl": {"30m", "12h"},
+    "cache_mode": {"implicit", "explicit"},
+    "cache_retention": {"in_memory", "24h"},
+    "cache_diagnostic_type": {"cache_hit", "cache_miss", "comparison_response_not_found", "unavailable"},
+    "cache_diagnostic_reason": {"model_changed", "prompt_cache_key_changed", "service_tier_changed", "tools_changed",
+                                "text_format_changed", "reasoning_effort_changed", "verbosity_changed",
+                                "context_compacted", "input_changed"},
     "backend": {"codex", "siwc"},
     "transport": {"http", "websocket"},
     "reason": {"invalid_json", "invalid_content_type", "body_too_large", "invalid_request", "thinking_display_invalid",
@@ -188,7 +196,8 @@ _ENUMS = {
 _NUMBERS = {"status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_tokens", "cached_tokens",
             "output_tokens", "total_tokens", "message_count", "tool_count", "content_items", "body_bytes",
             "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests",
-            "network_attempt"}
+            "network_attempt", "fingerprint_version", "cache_write_tokens", "cache_write_input_tokens",
+            "cache_write_ttl_30m_tokens", "cache_write_ttl_12h_tokens"}
 _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
                 "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
@@ -226,11 +235,17 @@ def emit(stage: str, **fields: Any) -> None:
             or (key in _NUMBERS and isinstance(value, int) and not isinstance(value, bool) and value >= 0)
             or (key in _IDENTIFIERS and isinstance(value, str) and len(value) in {12, 32}
                 and all(char in "0123456789abcdef" for char in value))
-            or (key in {"reused", "stream", "usage_available"} and isinstance(value, bool))
+            or (key in {"reused", "stream", "usage_available", "cache_write_usage_available"}
+                and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)
                 and all(isinstance(v, str) and len(v) == 32 and all(c in "0123456789abcdef" for c in v)
                         for v in value))
+            or (key == "client_cache_control_positions" and isinstance(value, list)
+                and all(isinstance(path, list) and 1 <= len(path) <= 64
+                        and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in path)
+                        and path[0] in {0, 1, 2, 3}
+                        for path in value))
         ):
             record[key] = value
     _LOG.info(json.dumps(record, separators=(",", ":")))
