@@ -468,8 +468,8 @@ def test_cache_transport_observation_preserves_events_and_payload(diagnostic_log
     assert next(iterator) is events[0] and len(observed) == 1
     assert list(iterator) == events[1:]
     data = records(diagnostic_log)
-    assert [r["stage"] for r in data] == ["cache_request", "cache_response"]
-    start, finish = data
+    assert [r["stage"] for r in data] == ["cache_request", "upstream_created", "cache_response"]
+    start, _, finish = data
     assert start["backend"] == backend and start["transport"] == transport
     assert finish["attempt_id"] == start["attempt_id"]
     assert finish["payload_hash"] == start["payload_hash"]
@@ -579,7 +579,7 @@ def test_cache_http_real_provider_boundary(diagnostic_log, monkeypatch, backend)
     data = records(diagnostic_log)
     assert len(captured) == 1
     assert [r["stage"] for r in data] == [
-        "cache_request", "cache_http_request", "cache_http_response", "cache_response"
+        "cache_request", "cache_http_request", "cache_http_response", "cache_response", "cache_http_closed"
     ]
     assert len({r["payload_hash"] for r in data}) == 1
     assert data[2]["status"] == 200 and data[2]["upstream_request_id"] == "req_boundary123"

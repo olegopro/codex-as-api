@@ -168,7 +168,19 @@ _ENUMS = {
               "request_metadata", "channel_selected", "output_key", "channel_released", "cancel_requested",
               "search_start", "search_completed", "search_error", "cache_request", "cache_response",
               "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request",
-              "client_cache_normalized"},
+              "client_cache_normalized", "client_disconnect_observed", "stream_cancel",
+              "upstream_created", "cache_http_closed", "transport_cancelled"},
+    "eof_kind": {"clean_eof", "consumer_closed", "cancelled", "event_timeout", "socket_timeout", "incomplete_read",
+                 "ssl_eof", "transport_error", "protocol_error", "http_protocol_error", "completed", "http_error"},
+    "cancel_origin": {"client_disconnect", "consumer_closed", "unknown"},
+    "lease_decision": {"reused_exact", "reused_replay", "new_no_anchor", "new_replay_mismatch",
+                       "new_ambiguous", "new_busy"},
+    "last_event_type": {"response.created", "response.in_progress", "response.completed", "response.failed",
+                        "response.incomplete", "response.output_text.delta", "response.output_item.added",
+                        "response.output_item.done", "response.function_call_arguments.delta",
+                        "response.reasoning_summary_text.delta", "error", "other"},
+    "error_category": {"upstream_error", "invalid_request_error", "model_not_found", "authentication_error",
+                       "catalog_unavailable", "upstream_protocol_error", "server_error"},
     "cache_ttl": {"30m", "12h"},
     "cache_mode": {"implicit", "explicit"},
     "cache_retention": {"in_memory", "24h"},
@@ -197,14 +209,17 @@ _NUMBERS = {"status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_t
             "output_tokens", "total_tokens", "message_count", "tool_count", "content_items", "body_bytes",
             "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests",
             "network_attempt", "fingerprint_version", "cache_write_tokens", "cache_write_input_tokens",
-            "cache_write_ttl_30m_tokens", "cache_write_ttl_12h_tokens"}
+            "cache_write_ttl_30m_tokens", "cache_write_ttl_12h_tokens", "event_count", "last_event_ms",
+            "upstream_bytes", "upstream_lines", "keepalive_lines", "cancel_ms", "close_ms"}
 _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
                 "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
                 "actual_model_hash", "service_tier_hash", "client_instructions_hash", "client_tools_hash",
-                "client_model_hash", "client_settings_hash"}
+                "client_model_hash", "client_settings_hash", "turn_state_hash", "routing_hint_hash",
+                "header_model_hash"}
 _UPSTREAM_IDS = {"upstream_request_id": re.compile(r"(?:req_[A-Za-z0-9_-]{1,160}|[0-9a-f-]{32,36})\Z"),
-                 "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z")}
+                 "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z"),
+                 "cf_ray": re.compile(r"[A-Fa-f0-9]{8,32}(?:-[A-Z]{3})?\Z")}
 _PROCESS_ID = uuid.uuid4().hex
 
 
@@ -235,7 +250,8 @@ def emit(stage: str, **fields: Any) -> None:
             or (key in _NUMBERS and isinstance(value, int) and not isinstance(value, bool) and value >= 0)
             or (key in _IDENTIFIERS and isinstance(value, str) and len(value) in {12, 32}
                 and all(char in "0123456789abcdef" for char in value))
-            or (key in {"reused", "stream", "usage_available", "cache_write_usage_available"}
+            or (key in {"reused", "stream", "usage_available", "cache_write_usage_available", "turn_state_present",
+                        "routing_hint_present", "socket_shutdown", "new_turn"}
                 and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)
@@ -281,8 +297,10 @@ class LifecycleMiddleware:
 
         async def observed_receive() -> Any:
             message = await receive()
-            if message["type"] == "http.disconnect" and not state.get("finished"):
+            if (message["type"] == "http.disconnect" and not state.get("finished")
+                    and not state.get("disconnected")):
                 state["disconnected"] = True
+                emit("client_disconnect_observed", elapsed_ms=round((time.monotonic() - state["started"]) * 1000))
             return message
 
         async def observed_send(message: Any) -> None:

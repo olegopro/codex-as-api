@@ -465,6 +465,16 @@ never inferred as zero. Count only completed `cache_response` events with
 valid usage; SIWC's existing `upstream_completed` events describe the same
 responses and must not be added again.
 
+The response ID is captured as soon as it appears, including `response.created`,
+so interrupted responses can be correlated without inventing final usage.
+Event counts, first/last event and first delta times are content-free metadata.
+`client_disconnect_observed` records the actual ASGI notification immediately;
+the final `http_disconnected` stage alone does not establish its time.
+`cache_http_closed` distinguishes clean EOF, cancellation, event timeout, socket
+timeout and transport/protocol failures, with body-byte, line and keepalive counts.
+Byte counts describe the decoded SSE body, not TLS/network traffic or token cost.
+Timings do not prove physical cache reuse or correctness of upstream accounting.
+
 The Anthropic ingress additionally records `client_cache_request` fingerprints
 of the original messages, system content, tools, requested model, and other
 settings before the adapter mutates the body. The settings hash also covers the
@@ -495,6 +505,49 @@ WebSocket records fingerprint the actual `response.create` message and link
 it to the existing channel/reuse events. Correlate by `process_id`, `http_id`,
 and `payload_hash`; attempt IDs identify their respective observation layers.
 The custom compaction JSON endpoint is outside this inference observation.
+
+HTTP response metadata also accepts allowlisted request-id aliases and `cf-ray`
+when supplied, and hashes `x-codex-turn-state`. The state value is never logged.
+`cf-ray` identifies CDN handling, not a model/cache node. Missing headers remain
+unknown; observing a routing token does not prove why a cache miss occurred.
+
+### Prepared Legacy cancellation and routing changes (Python)
+
+Legacy inference with a request cancellation control uses the same cancellable
+HTTPX transport as SIWC HTTP. Socket shutdown interrupts waiting for headers or
+body data. Catalog and compaction retain their existing bounded urllib path.
+Cancellation never automatically retries an in-flight generation. A Legacy SSE
+event deadline uses the configured timeout (default 300 seconds); comments and
+partial lines do not reset it. One temporary condition waiter per active Legacy
+stream stops on stream close. Keepalive pings to Claude Code remain independent.
+
+`CODEX_AS_API_LEGACY_ROUTING=observe` is the default: routing behavior is unchanged.
+`native` explicitly enables an experimental Legacy HTTP variant with a model/tier
+routing hint, separate thread IDs for exclusive matched histories, and turn-state
+echo. Prior input hashes and normalized output replay must match; parallel or
+ambiguous histories get separate state. New user items, configuration/credential
+changes, compaction or unmatched branches discard prior turn state. State is kept
+in memory only and is never globally shared by a Claude session. SIWC does not
+receive these private headers.
+
+Credential refresh resets turn state without changing a matched thread ID.
+Normal branch IDs are deterministic across restart/idle; competing or ambiguous
+lanes receive distinct IDs. Four compact anchors per history store only lengths,
+cumulative hashes and output keys. `lease_decision` and `new_turn` report why a
+history was selected. Header model fingerprints use `header_model_hash`, separate
+from model information in the response body. HTTPX cause chains distinguish
+timeouts, TLS EOF and HTTP protocol errors; the latter does not identify which
+server or edge caused a broken chunked response.
+
+This is a conservative history-based approximation of native Codex turn scope,
+not a proven mapping of all Claude Code synthetic messages, `/btw`, or branches.
+It can reset state unnecessarily. It is disabled until an isolated Legacy HTTP
+experiment is explicitly selected; local tests do not prove cache improvement.
+Live gateway updates and request-generating experiments require a separate safe
+activation step. Editing this checkout or building a wheel does not update a
+running gateway.
+The event deadline observes consumer-processed events: downstream backpressure
+lasting longer than the timeout can also close the upstream stream.
 
 Prompt text, tool arguments, encrypted reasoning, credentials, and raw account
 or session identifiers are not logged. Local files have mode `0600`, rotate

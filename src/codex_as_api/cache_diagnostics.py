@@ -122,12 +122,27 @@ def observe_events(
     )
     terminal = False
     reason = "upstream_incomplete"
+    response_id = None
+    event_count = 0
+    first_event_ms = first_delta_ms = last_event_ms = None
+    last_event_type = "other"
     try:
         for event in events:
             kind = event.get("type")
+            event_count += 1
+            last_event_ms = int(1000 * (time.monotonic() - started))
+            if first_event_ms is None:
+                first_event_ms = last_event_ms
+            if first_delta_ms is None and isinstance(kind, str) and kind.endswith(".delta"):
+                first_delta_ms = last_event_ms
+            last_event_type = kind if kind in diagnostics._ENUMS["last_event_type"] else "other"
+            response = event.get("response")
+            response = response if isinstance(response, dict) else {}
+            if response_id is None and isinstance(response.get("id"), str):
+                response_id = response["id"]
+                diagnostics.emit("upstream_created", attempt_id=attempt_id, upstream_response_id=response_id,
+                                 elapsed_ms=last_event_ms)
             if kind in {"response.completed", "response.failed", "response.incomplete", "error"}:
-                response = event.get("response")
-                response = response if isinstance(response, dict) else {}
                 usage = response.get("usage")
                 usage = usage if isinstance(usage, dict) else {}
                 details = usage.get("input_tokens_details")
@@ -144,7 +159,9 @@ def observe_events(
                     backend=backend, transport=transport,
                     reason="completed" if kind == "response.completed" else "upstream_failed",
                     elapsed_ms=int(1000 * (time.monotonic() - started)), usage_available=available,
-                    upstream_response_id=response.get("id"),
+                    upstream_response_id=response.get("id") or response_id,
+                    event_count=event_count, first_event_ms=first_event_ms, first_delta_ms=first_delta_ms,
+                    last_event_ms=last_event_ms, last_event_type=last_event_type,
                     actual_model_hash=_hash(response.get("model")),
                     service_tier_hash=_hash(response.get("service_tier")), **counts,
                     **_response_cache_metadata(response, usage, details),
@@ -166,31 +183,51 @@ def observe_events(
             if not terminal:
                 diagnostics.emit("cache_response", attempt_id=attempt_id, payload_hash=payload_hash,
                                  backend=backend, transport=transport, reason=reason, usage_available=False,
+                                 upstream_response_id=response_id, event_count=event_count,
+                                 first_event_ms=first_event_ms, first_delta_ms=first_delta_ms,
+                                 last_event_ms=last_event_ms, last_event_type=last_event_type,
                                  elapsed_ms=int(1000 * (time.monotonic() - started)))
 
 
-def http_request(payload: dict[str, Any], headers: Mapping[str, str], body: bytes, attempt: int) -> None:
+def http_request(
+    payload: dict[str, Any], headers: Mapping[str, str], body: bytes, attempt: int,
+    *, lease_decision: str | None = None, new_turn: bool | None = None,
+) -> str | None:
     if not diagnostics.enabled():
-        return
+        return None
+    payload_hash = _hash(payload)
     normalized = {k.lower(): v for k, v in headers.items()}
     routing = {k: normalized[k] for k in sorted(normalized) if k in {
         "session-id", "thread-id", "x-client-request-id", "chatgpt-account-id",
         "originator", "version", "user-agent", "openai-beta",
     } or k.startswith("x-codex-")}
     diagnostics.emit(
-        "cache_http_request", payload_hash=_hash(payload), routing_hash=_hash(routing), network_attempt=attempt,
+        "cache_http_request", payload_hash=payload_hash, routing_hash=_hash(routing), network_attempt=attempt,
+        lease_decision=lease_decision, new_turn=new_turn,
         wire_hash=hashlib.sha256(body).hexdigest()[:32],
         session_header_hash=_hash(normalized.get("session-id")),
         thread_header_hash=_hash(normalized.get("thread-id")),
         client_request_header_hash=_hash(normalized.get("x-client-request-id")),
         account_hash=_hash(normalized.get("chatgpt-account-id")),
+        turn_state_present=bool(normalized.get("x-codex-turn-state")),
+        turn_state_hash=_hash(normalized.get("x-codex-turn-state")),
+        routing_hint_present=bool(normalized.get("x-codex-routing-hint")),
+        routing_hint_hash=_hash(normalized.get("x-codex-routing-hint")),
     )
+    return payload_hash
 
 
 def http_response(payload: dict[str, Any], status: Any, headers: Any, attempt: int) -> None:
     if diagnostics.enabled():
+        normalized = {k.lower(): v for k, v in headers.items()} if headers else {}
         diagnostics.emit("cache_http_response", payload_hash=_hash(payload), status=status,
-                         network_attempt=attempt, upstream_request_id=headers.get("x-request-id") if headers else None)
+                         network_attempt=attempt,
+                         upstream_request_id=next((normalized[k] for k in
+                             ("x-request-id", "x-oai-request-id", "x-openai-request-id") if normalized.get(k)), None),
+                         cf_ray=normalized.get("cf-ray"),
+                         turn_state_present=bool(normalized.get("x-codex-turn-state")),
+                         turn_state_hash=_hash(normalized.get("x-codex-turn-state")),
+                         header_model_hash=_hash(normalized.get("openai-model")))
 
 
 def websocket_request(

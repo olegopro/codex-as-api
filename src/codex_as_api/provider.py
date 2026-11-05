@@ -10,6 +10,7 @@ import pathlib
 import platform
 import re
 import socket
+import ssl
 import threading
 import time
 import unicodedata
@@ -53,6 +54,7 @@ from .codex_version import (
 from .codex_version import (
     codex_cli_headers_for_version as _codex_version_headers_for_version,
 )
+from .diagnostics import emit as diagnostic_emit
 from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .model_capabilities import (
     DEFAULT_MODEL_CATALOG_TIMEOUT_SECONDS,
@@ -265,13 +267,18 @@ class _RequestCancellation:
     def check(self) -> None:
         with self._lock:
             if self._cancelled:
-                raise OSError("SIWC request was cancelled by the client")
+                raise OSError("Upstream request was cancelled by the client")
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
 
     @contextmanager
     def bind(self, callback: Callable[[], None]) -> Iterator[None]:
         with self._lock:
             if self._cancelled:
-                raise OSError("SIWC request was cancelled by the client")
+                raise OSError("Upstream request was cancelled by the client")
             self._callback = callback
         try:
             yield
@@ -281,6 +288,8 @@ class _RequestCancellation:
 
     def cancel(self) -> None:
         with self._lock:
+            if self._cancelled:
+                return
             self._cancelled = True
             callback, self._callback = self._callback, None
         if callback is not None:
@@ -397,6 +406,9 @@ def _validate_header_token(value: str, field: str) -> str:
 def _response_socket(response: Any) -> Any | None:
     stream = response
     for _ in range(2):
+        direct = getattr(stream, "_socket", None)
+        if direct is not None:
+            return direct
         buffered = getattr(stream, "fp", None)
         raw = getattr(buffered, "raw", None)
         sock = getattr(raw, "_sock", None)
@@ -406,6 +418,90 @@ def _response_socket(response: Any) -> Any | None:
             break
         stream = buffered
     return None
+
+
+def _stop_response(response: Any) -> None:
+    sock = _response_socket(response)
+    if sock is not None:
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+    else:
+        response.close()
+    diagnostic_emit("transport_cancelled", socket_shutdown=sock is not None)
+
+
+class _SSEIdleTimeoutError(TimeoutError):
+    pass
+
+
+class _LegacySSEReader:
+    """Bound time between SSE events, even when comments or partial lines arrive."""
+
+    def __init__(self, response: Any, timeout: float) -> None:
+        self.response = response
+        self.socket = _response_socket(response)
+        self.timeout = timeout
+        self.deadline = time.monotonic() + timeout
+        self.buffer = b""
+        self.expired = False
+        self._closed = False
+        self._condition = threading.Condition()
+        self._watcher = None
+        if self.socket is not None:
+            # One request-scoped waiter; recv timeouts alone are extended by
+            # heartbeat bytes and may be reset internally by HTTP transports.
+            self._watcher = threading.Thread(target=self._watch, name="legacy-sse-deadline", daemon=True)
+            self._watcher.start()
+
+    def _watch(self) -> None:
+        with self._condition:
+            while not self._closed:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    self.expired = True
+                    break
+                self._condition.wait(remaining)
+            if self._closed:
+                return
+        if self.socket is not None:
+            with suppress(OSError):
+                self.socket.shutdown(socket.SHUT_RDWR)
+
+    def event_received(self) -> None:
+        with self._condition:
+            self.deadline = time.monotonic() + self.timeout
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+        if self._watcher is not None:
+            self._watcher.join()
+
+    def readline(self) -> bytes:
+        while b"\n" not in self.buffer:
+            remaining = self.deadline - time.monotonic()
+            if self.expired or remaining <= 0:
+                raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE")
+            read1 = getattr(self.response, "read1", None)
+            if self.socket is None or not callable(read1):
+                return cast(bytes, self.response.readline())
+            self.socket.settimeout(remaining)
+            try:
+                chunk = read1(64 * 1024)
+            except (OSError, httpx.HTTPError) as exc:
+                if self.expired or time.monotonic() >= self.deadline:
+                    raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE") from exc
+                raise
+            if self.expired:
+                raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE")
+            if not chunk:
+                line, self.buffer = self.buffer, b""
+                return line
+            self.buffer += chunk
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return line + b"\n"
 
 
 def _read_response_before_deadline(response: Any, deadline: float) -> bytes:
@@ -522,13 +618,18 @@ def resolve_backend(value: str | None = None) -> str:
 
 
 class _HTTPXResponse:
-    """Публичный HTTP-поток подключается к существующему SSE-декодеру."""
+    """Cancellable HTTP stream connected to the existing SSE decoder."""
 
-    def __init__(self, response: httpx.Response) -> None:
+    def __init__(self, response: httpx.Response, network_stream: Any = None) -> None:
         self.headers = response.headers
+        self.status = response.status_code
+        self._socket = network_stream.get_extra_info("socket") if network_stream is not None else None
         self._response = response
         self._chunks = response.iter_bytes()
         self._buffer = b""
+
+    def read1(self, _size: int) -> bytes:
+        return cast(bytes, next(self._chunks, b""))
 
     def readline(self) -> bytes:
         while b"\n" not in self._buffer:
@@ -546,6 +647,25 @@ class _HTTPXResponse:
 
     def close(self) -> None:
         self._response.close()
+
+
+def _transport_eof_kind(exc: BaseException) -> str:
+    causes: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and len(causes) < 16 and all(current is not item for item in causes):
+        causes.append(current)
+        current = current.__cause__ or current.__context__
+    if any(isinstance(item, _SSEIdleTimeoutError) for item in causes):
+        return "event_timeout"
+    if any(isinstance(item, ssl.SSLEOFError) for item in causes):
+        return "ssl_eof"
+    if any(isinstance(item, http.client.IncompleteRead) for item in causes):
+        return "incomplete_read"
+    if any(isinstance(item, (TimeoutError, httpx.TimeoutException)) for item in causes):
+        return "socket_timeout"
+    if any(isinstance(item, httpx.RemoteProtocolError) for item in causes):
+        return "http_protocol_error"
+    return "transport_error"
 
 
 class ChatGPTOAuthProvider:
@@ -566,8 +686,16 @@ class ChatGPTOAuthProvider:
         catalog_ttl: float | None = None,
         version_resolver: CodexVersionResolver | CodexVersionProvider | None = None,
         siwc_transport: str | None = None,
+        legacy_routing: str | None = None,
     ) -> None:
         self.backend = resolve_backend(backend)
+        self.legacy_routing = legacy_routing or os.getenv("CODEX_AS_API_LEGACY_ROUTING", "observe")
+        if self.legacy_routing not in {"observe", "native"}:
+            raise ValueError("Legacy routing must be observe or native")
+        self._legacy_routing: Any = None
+        if self.backend == "codex" and self.legacy_routing == "native":
+            from .legacy_routing import LegacyRouting
+            self._legacy_routing = LegacyRouting()
         self.siwc_transport = siwc_transport or os.getenv("CODEX_AS_API_SIWC_TRANSPORT", "websocket")
         if self.backend == "siwc" and self.siwc_transport not in {"http", "websocket"}:
             raise ValueError("SIWC transport must be http or websocket")
@@ -656,33 +784,40 @@ class ChatGPTOAuthProvider:
     @contextmanager
     def _open_request(
         self, request: urllib.request.Request, *, timeout: float, cancel: _RequestCancellation | None = None,
+        skip_unauthorized_body: bool = False,
     ) -> Iterator[Any]:
-        if self.backend != "siwc":
+        if self.backend != "siwc" and cancel is None:
             with _urlopen_no_redirect(request, timeout=timeout) as response:
                 yield response
             return
-        if self.base_url != SIWC_BASE_URL or request.full_url not in {
+        if self.backend == "siwc" and (self.base_url != SIWC_BASE_URL or request.full_url not in {
             f"{SIWC_BASE_URL}/models", f"{SIWC_BASE_URL}/responses",
-        }:
+        }):
             raise ChatGPTOAuthInvalidRequestError("Адрес запроса не входит в публичный контракт SIWC")
         content = request.data
         if content is not None and not isinstance(content, bytes):
             raise ChatGPTOAuthInvalidRequestError("Тело публичного запроса должно содержать байты JSON")
-        # Honor the configured HTTPS proxy just as OAuth refresh and legacy do.
+        # The same cancellable transport serves SIWC HTTP and Legacy inference.
+        # Catalog/compact retain their bounded urllib path; all honor HTTPS_PROXY.
         client = self._http_client or httpx.Client(trust_env=True)
         response = None
         network_stream: Any = None
 
         def stop() -> None:
+            started = time.monotonic()
+            socket_shutdown = False
             if network_stream is not None:
                 raw_socket = network_stream.get_extra_info("socket")
                 if raw_socket is not None:
                     # close() не прерывает recv другого потока без shutdown().
                     with suppress(OSError):
                         raw_socket.shutdown(socket.SHUT_RDWR)
+                        socket_shutdown = True
                 network_stream.close()
             if response is not None:
                 response.close()
+            diagnostic_emit("transport_cancelled", socket_shutdown=socket_shutdown,
+                            cancel_ms=round(1000 * (time.monotonic() - started)))
 
         def trace(name: str, info: dict[str, Any]) -> None:
             nonlocal network_stream
@@ -712,9 +847,11 @@ class ChatGPTOAuthProvider:
                         error_headers[key] = value
                     raise urllib.error.HTTPError(
                         request.full_url, response.status_code, "Ошибка публичного API",
-                        error_headers, io.BytesIO(response.read()),
+                        error_headers, io.BytesIO(b"" if response.status_code == 401 and skip_unauthorized_body else
+                            _read_response_before_deadline(_HTTPXResponse(response, network_stream),
+                                                           time.monotonic() + timeout)),
                     )
-                yield _HTTPXResponse(response)
+                yield _HTTPXResponse(response, network_stream)
         except httpx.HTTPError as exc:
             raise OSError(str(exc)) from exc
         finally:
@@ -729,6 +866,8 @@ class ChatGPTOAuthProvider:
         failures: list[Exception] = []
         for response in responses:
             try:
+                if _response_socket(response) is not None:
+                    _stop_response(response)
                 response.close()
             except Exception as exc:  # noqa: BLE001 - close every active response before reporting
                 failures.append(exc)
@@ -1848,7 +1987,7 @@ class ChatGPTOAuthProvider:
         extra_headers: dict[str, str] | None = None,
         catalog_key: CatalogKey | None = None,
     ) -> Iterator[dict[str, Any]]:
-        cancel = getattr(extra_headers, "cancel", None) if self.backend == "siwc" else None
+        cancel = getattr(extra_headers, "cancel", None)
         if cancel is not None:
             cancel.check()
         if self.backend == "siwc" and self.siwc_transport == "websocket":
@@ -1890,11 +2029,20 @@ class ChatGPTOAuthProvider:
             token = self._token_for_request()
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
+            lease = None
             if self.backend == "codex":
                 headers["Accept"] = "text/event-stream"
                 headers.update(codex_session_headers(payload))
                 if extra_headers:
                     headers.update(extra_headers)
+                if self._legacy_routing is not None:
+                    model = _validate_header_token(payload.get("model", ""), "model")
+                    tier = payload.get("service_tier")
+                    headers["x-codex-routing-hint"] = (f"model={model};tier={_validate_header_token(tier, 'tier')}"
+                                                        if tier is not None else f"model={model}")
+                    lease = self._legacy_routing.reserve(payload, token.account_id, token.access_token)
+                    if lease is not None:
+                        headers.update(lease.headers())
             else:
                 _validate_siwc_wire_payload(payload)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
@@ -1905,11 +2053,22 @@ class ChatGPTOAuthProvider:
                 method="POST",
             )
             error_deadline = time.monotonic() + self.timeout
-            cache_diagnostics.http_request(payload, dict(req.header_items()), cast(bytes, req.data), attempt)
+            observed_hash = cache_diagnostics.http_request(
+                payload, dict(req.header_items()), cast(bytes, req.data), attempt,
+                lease_decision=lease.decision if lease is not None else None,
+                new_turn=lease.new_turn if lease is not None else None,
+            )
+            wire_started = time.monotonic()
+            close_started = None
+            wire_counts = {"upstream_bytes": 0, "upstream_lines": 0, "keepalive_lines": 0}
+            eof_kind = "transport_error"
             try:
-                with self._open_request(req, timeout=self.timeout, cancel=cancel) as response:
+                with self._open_request(req, timeout=self.timeout, cancel=cancel,
+                                        skip_unauthorized_body=attempt == 0) as response:
                     cache_diagnostics.http_response(payload, getattr(response, "status", None),
                                                     getattr(response, "headers", None), attempt)
+                    if lease is not None:
+                        lease.response_headers(response.headers)
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,
@@ -1918,15 +2077,25 @@ class ChatGPTOAuthProvider:
                     with self._active_response_lock:
                         self._active_responses.add(response)
                     block: list[str] = []
+                    reader = _LegacySSEReader(response, self.timeout) if self.backend == "codex" else response
                     try:
                         while True:
-                            raw_line = response.readline()
+                            raw_line = reader.readline()
                             if cancel is not None:
                                 cancel.check()
+                            wire_counts["upstream_bytes"] += len(raw_line)
+                            wire_counts["upstream_lines"] += bool(raw_line)
+                            wire_counts["keepalive_lines"] += raw_line.startswith(b":")
                             if raw_line == b"":
+                                if eof_kind != "completed":
+                                    eof_kind = "clean_eof"
                                 if block:
                                     event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
                                     if event is not None:
+                                        if lease is not None:
+                                            lease.observe(event)
+                                        if event.get("type") == "response.completed":
+                                            eof_kind = "completed"
                                         if event.get("type") in {
                                             "error",
                                             "response.failed",
@@ -1945,6 +2114,12 @@ class ChatGPTOAuthProvider:
                                 event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
                                 block = []
                                 if event is not None:
+                                    if lease is not None:
+                                        lease.observe(event)
+                                    if self.backend == "codex":
+                                        reader.event_received()
+                                    if event.get("type") == "response.completed":
+                                        eof_kind = "completed"
                                     if event.get("type") in {
                                         "error",
                                         "response.failed",
@@ -1955,9 +2130,13 @@ class ChatGPTOAuthProvider:
                                 continue
                             block.append(line)
                     finally:
+                        if self.backend == "codex":
+                            reader.close()
+                        close_started = time.monotonic()
                         with self._active_response_lock:
                             self._active_responses.discard(response)
             except urllib.error.HTTPError as exc:
+                eof_kind = "http_error"
                 cache_diagnostics.http_response(payload, exc.code, exc.headers, attempt)
                 if exc.code == 401 and attempt == 0:
                     exc.close()
@@ -1969,13 +2148,30 @@ class ChatGPTOAuthProvider:
                     f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}",
                     code=_upstream_error_code(redacted),
                 ) from exc
+            except GeneratorExit:
+                if eof_kind != "completed":
+                    eof_kind = "consumer_closed"
+                raise
             except ChatGPTOAuthError:
+                eof_kind = "protocol_error"
                 raise
             except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                eof_kind = "cancelled" if cancel is not None and cancel.cancelled else _transport_eof_kind(exc)
                 raise ChatGPTOAuthUpstreamError(
                     502,
                     f"ChatGPT OAuth transport failed: {redact_text(str(exc), *token_values)}",
                 ) from exc
+            finally:
+                if lease is not None:
+                    self._legacy_routing.release(lease)
+                if cache_diagnostics.diagnostics.enabled():
+                    diagnostic_emit(
+                        "cache_http_closed", payload_hash=observed_hash, network_attempt=attempt,
+                        eof_kind=eof_kind, **wire_counts,
+                        elapsed_ms=round(1000 * (time.monotonic() - wire_started)),
+                        close_ms=(round(1000 * (time.monotonic() - close_started))
+                                  if close_started is not None else None),
+                    )
             return
 
     def _request_json(

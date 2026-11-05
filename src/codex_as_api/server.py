@@ -282,6 +282,9 @@ async def _anthropic_heartbeat(
         finally:
             try:
                 if not finished and cancel is not None:
+                    context = diagnostic_context()
+                    diagnostic_emit("stream_cancel", cancel_origin=("client_disconnect" if context
+                                    and context.get("disconnected") else "unknown"))
                     with anyio.CancelScope(shield=True):
                         # Приёмники/preflight могут занять все общие рабочие потоки.
                         await anyio.to_thread.run_sync(cancel.cancel, limiter=_anthropic_cancel_limiter)
@@ -2896,7 +2899,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 if (context := diagnostic_context()) is not None:
                     context["failed"] = True
-                diagnostic_emit("upstream_error", reason="stream_error")
+                diagnostic_emit("upstream_error", reason="stream_error", error_category=_error_type(exc))
                 status = _anthropic_error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
                 error = format_anthropic_error(status, _public_error_message(exc))
                 yield f"event: error\ndata: {json.dumps(error, ensure_ascii=False)}\n\n"
