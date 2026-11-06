@@ -2868,6 +2868,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     suppress_thinking_output = thinking_disabled or effective_reasoning_effort in {"none", "disabled"}
 
     if stream:
+        stream_input_token_estimate = _estimate_input_tokens(messages, tools)
 
         def _stream() -> Iterator[str]:
             request_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -2903,6 +2904,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                     backend_model=request_model,
                     thinking_disabled=suppress_thinking_output,
                     stop_sequences=local_stop_sequences,
+                    input_token_estimate=stream_input_token_estimate,
                 )
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 if (context := diagnostic_context()) is not None:

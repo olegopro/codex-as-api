@@ -1067,6 +1067,7 @@ def anthropic_stream_adapter(
     backend_model: str | None = None,
     thinking_disabled: bool = False,
     stop_sequences: Sequence[str] | None = None,
+    input_token_estimate: int = 0,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
     if thinking_display not in {"summarized", "omitted", "updates"}:
@@ -1075,7 +1076,9 @@ def anthropic_stream_adapter(
         not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
     ):
         raise ValueError("backend_model must be a non-empty string when provided")
-    yield _message_start_sse(model, request_id)
+    if not isinstance(input_token_estimate, int) or isinstance(input_token_estimate, bool) or input_token_estimate < 0:
+        raise ValueError("input_token_estimate must be a non-negative integer")
+    yield _message_start_sse(model, request_id, input_token_estimate)
     if stop_sequences:
         event_stream = _stop_sequence_events(event_stream, stop_sequences)
     try:
@@ -1092,7 +1095,7 @@ def anthropic_stream_adapter(
                 close()
 
 
-def _message_start_sse(model: str, request_id: str) -> str:
+def _message_start_sse(model: str, request_id: str, input_tokens: int = 0) -> str:
     return _sse(
         "message_start",
         {
@@ -1108,8 +1111,11 @@ def _message_start_sse(model: str, request_id: str) -> str:
                 "stop_reason": None,
                 "stop_sequence": None,
                 # Provisional; message_delta carries authoritative cumulative usage.
+                # The local input estimate fills only the input bucket: the client
+                # keeps a non-zero start value when the final bucket is zero, and
+                # the cache buckets stay zero so a miss cannot be masked.
                 "usage": {
-                    "input_tokens": 0,
+                    "input_tokens": input_tokens,
                     "output_tokens": 0,
                     "cache_read_input_tokens": 0,
                     "cache_creation_input_tokens": 0,
