@@ -1558,13 +1558,7 @@ class TestInternalResponseToAnthropic:
 
 
 class TestAnthropicStreamAdapter:
-    def _collect_events(
-        self,
-        events: list[dict],
-        *,
-        thinking_display: str = "summarized",
-        input_token_estimate: int = 0,
-    ) -> list[dict]:
+    def _collect_events(self, events: list[dict], *, thinking_display: str = "summarized") -> list[dict]:
         """Run stream adapter and parse the SSE output back into dicts."""
         result = []
         for sse_str in anthropic_stream_adapter(
@@ -1572,7 +1566,6 @@ class TestAnthropicStreamAdapter:
             "test-model",
             "msg_test",
             thinking_display=thinking_display,
-            input_token_estimate=input_token_estimate,
         ):
             for line in sse_str.strip().split("\n"):
                 if line.startswith("data: "):
@@ -1613,27 +1606,6 @@ class TestAnthropicStreamAdapter:
         assert len(text_deltas) == 2
         assert text_deltas[0]["delta"]["text"] == "Hello"
         assert text_deltas[1]["delta"]["text"] == " world"
-
-    def test_message_start_carries_input_estimate(self):
-        events = [
-            {
-                "type": "finish",
-                "finish_reason": "stop",
-                "usage": {"input_tokens": 2, "output_tokens": 5, "total_tokens": 7},
-            },
-        ]
-        result = self._collect_events(events, input_token_estimate=1234)
-        assert result[0]["type"] == "message_start"
-        assert result[0]["message"]["usage"] == {
-            "input_tokens": 1234,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-        }
-        # The authoritative cumulative usage still arrives in message_delta.
-        delta = next(e for e in result if e["type"] == "message_delta")
-        assert delta["usage"]["input_tokens"] == 2
-        assert delta["usage"]["output_tokens"] == 5
 
     def test_empty_text_and_reasoning_deltas_are_preserved(self):
         result = self._collect_events(
