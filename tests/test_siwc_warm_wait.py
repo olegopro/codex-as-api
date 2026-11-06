@@ -97,6 +97,62 @@ def test_wait_times_out_once_and_opens_an_independent_channel(contention):
         pool.close()
 
 
+@pytest.mark.parametrize("release_after,expected", [(15, "acquired"), (25, "timeout")])
+def test_default_wait_covers_fifteen_seconds_but_not_twenty_five(monkeypatch, release_after, expected):
+    now = [1000.0]
+    events, waits = [], []
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(siwc_transport, "diagnostic_emit", lambda stage, **fields: events.append(
+        {"stage": stage, **fields},
+    ))
+    monkeypatch.setattr(siwc_transport, "connect", lambda *_a, **_k: FakeSocket([completed()]))
+    pool = SIWCWebSocketPool()
+    try:
+        list(pool.events({"input": ROOT}, **OPTIONS))
+        key, entry = next(iter(pool._connections.items()))
+        entry.users = 1
+
+        def wait(timeout):
+            waits.append(timeout)
+            now[0] += min(timeout, release_after)
+            if release_after <= timeout:
+                entry.users = 0
+
+        monkeypatch.setattr(pool._condition, "wait", wait)
+        selected = pool._reserve(key[:4], MAIN, "continuation", token_hash=entry.token_hash, timeout=60)
+        assert waits == [20]
+        assert (selected is entry) == (expected == "acquired")
+        assert events[-2]["wait_outcome"] == expected
+        assert pool._waiters == 0
+        entry.users = selected.users = 0
+    finally:
+        pool.close()
+
+
+def test_default_pool_keeps_forty_minute_idle_channel_but_preserves_absolute_age(monkeypatch):
+    now, sockets = [1000.0], []
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: now[0])
+
+    def connect(*_args, **_kwargs):
+        socket = FakeSocket([completed()])
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    try:
+        list(pool.events({"input": ROOT}, **OPTIONS))
+        now[0] += 40 * 60
+        list(pool.events({"input": MAIN}, **OPTIONS))
+        assert len(sockets) == 1
+        now[0] = 1000 + 55 * 60 + 1
+        tail = [*MAIN, ANSWER, {"role": "user", "content": "again"}]
+        list(pool.events({"input": tail}, **OPTIONS))
+        assert len(sockets) == 2 and sockets[0].closed
+    finally:
+        pool.close()
+
+
 @pytest.mark.parametrize("stop", ["cancel", "close_pool"])
 def test_wait_is_woken_by_cancel_or_pool_shutdown(contention, stop):
     create, sockets, events, entered = contention

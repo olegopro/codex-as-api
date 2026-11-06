@@ -158,8 +158,8 @@ class _Connection:
 class SIWCWebSocketPool:
     """Каналы по аккаунту/сессии/модели/ветке, без локального потолка по умолчанию."""
 
-    def __init__(self, *, limit: int | None = None, idle_timeout: float = 1800.0,
-                 warm_wait_seconds: float = 10.0, max_waiters: int = 8) -> None:
+    def __init__(self, *, limit: int | None = None, idle_timeout: float = 3300.0,
+                 warm_wait_seconds: float = 20.0, max_waiters: int = 8) -> None:
         if not 0 <= warm_wait_seconds <= 30 or not 0 <= max_waiters <= 64:
             raise ValueError("SIWC warm wait must be 0..30 seconds with 0..64 waiters")
         self._limit = limit
