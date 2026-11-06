@@ -165,7 +165,8 @@ _context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar
 _ENUMS = {
     "stage": {"http_start", "validation_error", "http_start_response", "http_stream_finished", "http_error",
               "http_cancelled", "http_disconnected", "upstream_start", "upstream_completed", "upstream_error",
-              "request_metadata", "channel_selected", "output_key", "channel_released", "cancel_requested",
+              "request_metadata", "channel_selected", "channel_wait_started", "channel_wait_finished", "output_key",
+              "channel_released", "cancel_requested",
               "search_start", "search_completed", "search_error", "cache_request", "cache_response",
               "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request",
               "client_cache_normalized", "client_disconnect_observed", "stream_cancel",
@@ -213,6 +214,7 @@ _ENUMS = {
                "upstream_incomplete", "upstream_error", "interrupted", "stream_error", "completed",
                "search_unavailable", "search_timeout", "search_failed"},
     "selection_reason": {"new", "existing", "input_mismatch", "missing_key", "replay_mismatch"},
+    "wait_outcome": {"not_needed", "acquired", "timeout", "cancelled", "capacity", "affinity_lost", "error"},
     "output_key_source": {"done", "completed"},
     "output_key_error": {"none", "invalid_output"},
     "thinking_display": {"omitted", "summarized", "updates"},
@@ -224,7 +226,7 @@ _ENUMS = {
               "gpt-6.1-sol", "gpt-6.1-terra"},
 }
 _NUMBERS = {"active_histories", "status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_tokens",
-            "cached_tokens",
+            "cached_tokens", "channel_wait_ms", "active_waiters",
             "output_tokens", "total_tokens", "message_count", "tool_count", "content_items", "body_bytes",
             "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests",
             "network_attempt", "fingerprint_version", "cache_write_tokens", "cache_write_input_tokens",

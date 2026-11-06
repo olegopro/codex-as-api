@@ -276,6 +276,7 @@ class _RequestCancellation:
 
     @contextmanager
     def bind(self, callback: Callable[[], None]) -> Iterator[None]:
+        # One active binding: pool-wait wakeup ends before the socket-close binding.
         with self._lock:
             if self._cancelled:
                 raise OSError("Upstream request was cancelled by the client")
