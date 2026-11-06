@@ -276,6 +276,11 @@ class SIWCWebSocketPool:
                         ))
                         entry.token_hash = token_hash
                         entry.opened_at = time.monotonic()
+                        handshake = getattr(entry.socket, "response", None)
+                        handshake_headers = getattr(handshake, "headers", None)
+                        if handshake_headers is not None:
+                            diagnostic_emit("websocket_handshake", channel_id=entry.channel_id,
+                                            turn_state_present="x-codex-turn-state" in handshake_headers)
                     diagnostic_emit("upstream_start", attempt_id=request_id, channel_id=entry.channel_id,
                                     reused=reused, reason=connection_reason)
                     socket = entry.socket

@@ -192,6 +192,10 @@ def observe_events(
 def http_request(
     payload: dict[str, Any], headers: Mapping[str, str], body: bytes, attempt: int,
     *, lease_decision: str | None = None, new_turn: bool | None = None,
+    routing_mode: str | None = None, would_echo: bool | None = None,
+    history_id: str | None = None, active_histories: int | None = None,
+    mixed_user_tool: bool | None = None,
+    new_turn_v2: bool | None = None, rule_disagreement: bool | None = None,
 ) -> str | None:
     if not diagnostics.enabled():
         return None
@@ -203,7 +207,12 @@ def http_request(
     } or k.startswith("x-codex-")}
     diagnostics.emit(
         "cache_http_request", payload_hash=payload_hash, routing_hash=_hash(routing), network_attempt=attempt,
+        routing_config_hash=_hash({k: v for k, v in routing.items() if k != "x-codex-turn-state"}),
         lease_decision=lease_decision, new_turn=new_turn,
+        routing_mode=routing_mode, would_echo=would_echo, history_hash=_hash(history_id),
+        active_histories=active_histories,
+        mixed_user_tool=mixed_user_tool,
+        new_turn_v2=new_turn_v2, rule_disagreement=rule_disagreement,
         wire_hash=hashlib.sha256(body).hexdigest()[:32],
         session_header_hash=_hash(normalized.get("session-id")),
         thread_header_hash=_hash(normalized.get("thread-id")),

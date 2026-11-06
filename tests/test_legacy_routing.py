@@ -17,8 +17,8 @@ def payload(*items, model="gpt-6-luna", session="session"):
     return {"model": model, "prompt_cache_key": session, "instructions": "rules", "input": list(items or [USER])}
 
 
-def reserve(pool, body=None, *, account="account", token="token"):
-    lease = pool.reserve(body or payload(), account, token)
+def reserve(pool, body=None, *, account="account", owner="owner"):
+    lease = pool.reserve(body or payload(), account, owner)
     assert lease is not None
     return lease
 
@@ -61,7 +61,7 @@ def test_parallel_identical_requests_never_share_a_history_or_turn_state():
     pool.release(c)
 
 
-@pytest.mark.parametrize("changed", ["model", "instructions", "tools", "reasoning", "service_tier"])
+@pytest.mark.parametrize("changed", ["model", "instructions", "service_tier"])
 def test_effective_config_change_does_not_echo_old_turn_state(changed):
     pool = LegacyRouting()
     a = reserve(pool)
@@ -71,6 +71,19 @@ def test_effective_config_change_does_not_echo_old_turn_state(changed):
     b = reserve(pool, body)
     assert "x-codex-turn-state" not in b.headers()
     pool.release(b)
+
+
+@pytest.mark.parametrize("changed", ["tools", "reasoning"])
+def test_tool_loading_and_reasoning_updates_do_not_reset_turn(changed):
+    pool = LegacyRouting()
+    first = reserve(pool)
+    complete(pool, first, CALL)
+    body = payload(USER, CALL, RESULT)
+    body[changed] = {"tools": [{"type": "function", "name": "new_tool"}],
+                     "reasoning": {"effort": "high"}}[changed]
+    next_step = reserve(pool, body)
+    assert next_step.turn_state == "sticky-token"
+    pool.release(next_step)
 
 
 @pytest.mark.parametrize("change", ["account", "session", "first_user", "replay"])
@@ -141,11 +154,11 @@ def test_routing_is_opt_in_and_never_applied_to_siwc(monkeypatch):
         ChatGPTOAuthProvider(legacy_routing="invalid")
 
 
-def test_token_refresh_preserves_thread_identity_and_only_resets_turn_state():
+def test_owner_change_preserves_thread_identity_and_resets_turn_state():
     pool = LegacyRouting()
     a = reserve(pool)
     complete(pool, a, CALL)
-    b = reserve(pool, payload(USER, CALL, RESULT), token="refreshed")
+    b = reserve(pool, payload(USER, CALL, RESULT), owner="new-login")
     assert b.entry.thread_id == a.entry.thread_id and b.decision == "reused_replay"
     assert "x-codex-turn-state" not in b.headers()
     pool.release(b)
@@ -157,7 +170,134 @@ def test_normal_thread_identity_survives_registry_restart_and_anchors_are_compac
     complete(pool, a, CALL)
     b = reserve(LegacyRouting())
     assert b.entry.thread_id == a.entry.thread_id
-    assert len(a.entry.anchors[0]) == 3 and isinstance(a.entry.anchors[0][0], int)
+    assert a.entry.anchors[0].size == 1 and isinstance(a.entry.anchors[0].prefix, str)
+
+
+def test_branch_between_tool_steps_cannot_replace_main_turn_state():
+    pool = LegacyRouting()
+    main = reserve(pool)
+    complete(pool, main, CALL)
+    fork = reserve(pool, payload(USER, CALL, {"role": "user", "content": "BTW task"}))
+    assert fork.new_turn and fork.turn_state is None
+    fork.response_headers({"x-codex-turn-state": "fork-token"})
+    fork.observe({"type": "response.completed", "response": {"output": []}})
+    pool.release(fork)
+    continuation = reserve(pool, payload(USER, CALL, RESULT))
+    assert continuation.turn_state == "sticky-token"
+    assert continuation.entry is main.entry
+    pool.release(continuation)
+
+
+def test_rejection_invalidates_chain_but_not_sibling_turn():
+    pool = LegacyRouting()
+    main = reserve(pool)
+    complete(pool, main, CALL)
+    retry = reserve(pool)
+    assert retry.turn_state == "sticky-token"
+    retry.reject_turn_state()
+    retry.response_headers({"x-codex-turn-state": "ignored-after-rejection"})
+    pool.release(retry)
+    continuation = reserve(pool, payload(USER, CALL, RESULT))
+    assert continuation.turn_state is None
+    pool.release(continuation)
+
+
+@pytest.mark.parametrize("value", ["", "bad\r\nheader", "a" * 8193, "non-ascii-\u00e9"])
+def test_turn_state_header_validation(value):
+    pool = LegacyRouting()
+    lease = reserve(pool)
+    lease.response_headers({"x-codex-turn-state": value})
+    assert lease.turn_state is None
+    pool.release(lease)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "turn-state", "native"])
+@pytest.mark.parametrize("failure", [None, "reserve", "prepare", "http", "sse"])
+def test_provider_shadow_and_echo_only_preserve_payload_and_owner_refresh(monkeypatch, mode, failure):
+    import io
+    import json
+    import urllib.error
+
+    from codex_as_api import cache_diagnostics
+    from codex_as_api.auth import ChatGPTOAuthUpstreamError
+
+    from .test_provider import _BufferedUpstreamResponse, _test_token
+
+    provider = ChatGPTOAuthProvider(legacy_routing=mode)
+    token = _test_token()
+    token.user_id, token.login_generation = "user", "login"
+    monkeypatch.setattr(provider, "_token_for_request", lambda: token)
+    sent = []
+    if failure == "reserve":
+        def broken_reserve(*args):
+            raise RuntimeError("synthetic routing failure")
+        monkeypatch.setattr(provider._legacy_routing, "reserve", broken_reserve)
+    original_http_request = cache_diagnostics.http_request
+    if failure == "prepare":
+        def broken_prepare(*args, **kwargs):
+            raise RuntimeError("synthetic wire preparation failure")
+        monkeypatch.setattr(cache_diagnostics, "http_request", broken_prepare)
+
+    def open_request(request, **kwargs):
+        assert request.data == original.encode("utf-8")
+        sent.append({k.lower(): v for k, v in request.header_items()})
+        if failure == "http" and len(sent) == 2:
+            raise urllib.error.HTTPError(request.full_url, 400, "rejected", {}, io.BytesIO(b'{}'))
+        if failure == "sse" and len(sent) == 2:
+            response = _BufferedUpstreamResponse(b'data: {"type":"response.failed","response":{"error":{}}}\n\n')
+            response.headers, response.status = {}, 200
+            return response
+        response = _BufferedUpstreamResponse(b'data: {"type":"response.completed","response":{}}\n\n')
+        response.headers = {"x-codex-turn-state": "first-token" if len(sent) == 1 else "ignored-later"}
+        response.status = 200
+        return response
+
+    monkeypatch.setattr(provider, "_open_request", open_request)
+    body = payload()
+    original = json.dumps(body)
+    try:
+        if failure == "reserve" and mode == "native":
+            with pytest.raises(RuntimeError, match="routing failure"):
+                list(provider._post_sse("/responses", body))
+            assert not sent
+            return
+        if failure == "prepare":
+            with pytest.raises(RuntimeError, match="preparation failure"):
+                list(provider._post_sse("/responses", body))
+            assert not any(entry.busy for entry in provider._legacy_routing._entries.values())
+            monkeypatch.setattr(cache_diagnostics, "http_request", original_http_request)
+        for _ in range(3):
+            if failure == "http" and len(sent) == 1:
+                with pytest.raises(ChatGPTOAuthUpstreamError):
+                    list(provider._post_sse("/responses", body))
+                assert len(sent) == 2  # No automatic retry of the failed generation.
+            else:
+                list(provider._post_sse("/responses", body))
+            token.access_token = "ordinary-refreshed-access"
+    finally:
+        provider.close()
+    assert json.dumps(body) == original
+    assert "x-codex-turn-state" not in sent[0]
+    if mode == "shadow" or failure == "reserve":
+        assert all("x-codex-turn-state" not in r for r in sent)
+    elif failure in {"http", "sse"}:
+        assert sent[1]["x-codex-turn-state"] == "first-token"
+        assert "x-codex-turn-state" not in sent[2]
+    else:
+        assert sent[1]["x-codex-turn-state"] == sent[2]["x-codex-turn-state"] == "first-token"
+    if mode != "native":
+        assert all("x-codex-routing-hint" not in r for r in sent)
+        assert all(r["thread-id"] == r["session-id"] == r["x-client-request-id"] for r in sent)
+
+
+def test_mixed_tool_result_and_text_is_a_conservative_boundary():
+    pool = LegacyRouting()
+    first = reserve(pool)
+    complete(pool, first, CALL)
+    next_step = reserve(pool, payload(USER, CALL, RESULT, {"role": "user", "content": "hook or steering"}))
+    assert next_step.new_turn and next_step.mixed_user_tool and next_step.turn_state is None
+    assert next_step.new_turn_v2 is False  # Shadow comparison only; conservative rule still controls echo.
+    pool.release(next_step)
 
 
 def test_real_legacy_adapter_replays_encrypted_reasoning_text_and_call(monkeypatch, model_catalog_snapshot):

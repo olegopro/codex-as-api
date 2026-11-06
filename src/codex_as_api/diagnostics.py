@@ -169,7 +169,11 @@ _ENUMS = {
               "search_start", "search_completed", "search_error", "cache_request", "cache_response",
               "cache_http_request", "cache_http_response", "cache_websocket_request", "client_cache_request",
               "client_cache_normalized", "client_disconnect_observed", "stream_cancel",
-              "upstream_created", "cache_http_closed", "transport_cancelled"},
+              "upstream_created", "cache_http_closed", "transport_cancelled", "turn_state_rejected",
+              "legacy_routing_error", "websocket_handshake"},
+    "routing_mode": {"observe", "shadow", "turn-state", "native"},
+    "rejection_source": {"http_status", "sse_terminal"},
+    "routing_error_kind": {"reserve", "release", "observe", "response_headers"},
     "eof_kind": {"clean_eof", "consumer_closed", "cancelled", "event_timeout", "socket_timeout", "incomplete_read",
                  "ssl_eof", "transport_error", "protocol_error", "http_protocol_error", "completed", "http_error"},
     "cancel_origin": {"client_disconnect", "consumer_closed", "unknown"},
@@ -205,7 +209,8 @@ _ENUMS = {
               "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-chat-thinking",
               "gpt-6.1-sol", "gpt-6.1-terra"},
 }
-_NUMBERS = {"status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_tokens", "cached_tokens",
+_NUMBERS = {"active_histories", "status", "elapsed_ms", "first_event_ms", "first_delta_ms", "input_tokens",
+            "cached_tokens",
             "output_tokens", "total_tokens", "message_count", "tool_count", "content_items", "body_bytes",
             "free_candidates", "busy_candidates", "done_count", "completed_count", "result_count", "search_requests",
             "network_attempt", "fingerprint_version", "cache_write_tokens", "cache_write_input_tokens",
@@ -216,7 +221,7 @@ _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
                 "actual_model_hash", "service_tier_hash", "client_instructions_hash", "client_tools_hash",
                 "client_model_hash", "client_settings_hash", "turn_state_hash", "routing_hint_hash",
-                "header_model_hash"}
+                "header_model_hash", "routing_config_hash", "history_hash"}
 _UPSTREAM_IDS = {"upstream_request_id": re.compile(r"(?:req_[A-Za-z0-9_-]{1,160}|[0-9a-f-]{32,36})\Z"),
                  "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z"),
                  "cf_ray": re.compile(r"[A-Fa-f0-9]{8,32}(?:-[A-Z]{3})?\Z")}
@@ -250,8 +255,9 @@ def emit(stage: str, **fields: Any) -> None:
             or (key in _NUMBERS and isinstance(value, int) and not isinstance(value, bool) and value >= 0)
             or (key in _IDENTIFIERS and isinstance(value, str) and len(value) in {12, 32}
                 and all(char in "0123456789abcdef" for char in value))
-            or (key in {"reused", "stream", "usage_available", "cache_write_usage_available", "turn_state_present",
-                        "routing_hint_present", "socket_shutdown", "new_turn"}
+            or (key in {"would_echo", "reused", "stream", "usage_available", "cache_write_usage_available",
+                        "turn_state_present", "routing_hint_present", "socket_shutdown", "new_turn", "mixed_user_tool",
+                        "new_turn_v2", "rule_disagreement"}
                 and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)

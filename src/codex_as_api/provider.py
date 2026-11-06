@@ -690,10 +690,10 @@ class ChatGPTOAuthProvider:
     ) -> None:
         self.backend = resolve_backend(backend)
         self.legacy_routing = legacy_routing or os.getenv("CODEX_AS_API_LEGACY_ROUTING", "observe")
-        if self.legacy_routing not in {"observe", "native"}:
-            raise ValueError("Legacy routing must be observe or native")
+        if self.legacy_routing not in {"observe", "shadow", "turn-state", "native"}:
+            raise ValueError("Legacy routing must be observe, shadow, turn-state or native")
         self._legacy_routing: Any = None
-        if self.backend == "codex" and self.legacy_routing == "native":
+        if self.backend == "codex" and self.legacy_routing != "observe":
             from .legacy_routing import LegacyRouting
             self._legacy_routing = LegacyRouting()
         self.siwc_transport = siwc_transport or os.getenv("CODEX_AS_API_SIWC_TRANSPORT", "websocket")
@@ -859,6 +859,15 @@ class ChatGPTOAuthProvider:
                 response.close()
             if self._http_client is None:
                 client.close()
+
+    def _legacy_routing_call(self, operation: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return callback(*args, **kwargs)
+        except Exception:
+            if self.legacy_routing == "native":
+                raise
+            diagnostic_emit("legacy_routing_error", routing_mode=self.legacy_routing, routing_error_kind=operation)
+            return None
 
     def cancel_current_requests(self) -> None:
         with self._active_response_lock:
@@ -2030,45 +2039,60 @@ class ChatGPTOAuthProvider:
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
             lease = None
-            if self.backend == "codex":
-                headers["Accept"] = "text/event-stream"
-                headers.update(codex_session_headers(payload))
-                if extra_headers:
-                    headers.update(extra_headers)
-                if self._legacy_routing is not None:
-                    model = _validate_header_token(payload.get("model", ""), "model")
-                    tier = payload.get("service_tier")
-                    headers["x-codex-routing-hint"] = (f"model={model};tier={_validate_header_token(tier, 'tier')}"
-                                                        if tier is not None else f"model={model}")
-                    lease = self._legacy_routing.reserve(payload, token.account_id, token.access_token)
-                    if lease is not None:
-                        headers.update(lease.headers())
-            else:
-                _validate_siwc_wire_payload(payload)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
-            req = urllib.request.Request(
-                self.base_url + path,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
             error_deadline = time.monotonic() + self.timeout
-            observed_hash = cache_diagnostics.http_request(
-                payload, dict(req.header_items()), cast(bytes, req.data), attempt,
-                lease_decision=lease.decision if lease is not None else None,
-                new_turn=lease.new_turn if lease is not None else None,
-            )
+            observed_hash = None
             wire_started = time.monotonic()
             close_started = None
             wire_counts = {"upstream_bytes": 0, "upstream_lines": 0, "keepalive_lines": 0}
             eof_kind = "transport_error"
             try:
+                if self.backend == "codex":
+                    headers["Accept"] = "text/event-stream"
+                    headers.update(codex_session_headers(payload))
+                    if extra_headers:
+                        headers.update(extra_headers)
+                    if self._legacy_routing is not None:
+                        # Login ownership changes invalidate state; ordinary refresh does not.
+                        user = getattr(token, "user_id", None)
+                        generation = getattr(token, "login_generation", None)
+                        owner = json.dumps([user, generation, token.access_token if not (user or generation) else None])
+                        lease = self._legacy_routing_call("reserve", self._legacy_routing.reserve,
+                                                          payload, token.account_id, owner)
+                        if self.legacy_routing == "native":
+                            model = _validate_header_token(payload.get("model", ""), "model")
+                            tier = payload.get("service_tier")
+                            headers["x-codex-routing-hint"] = (
+                                f"model={model};tier={_validate_header_token(tier, 'tier')}"
+                                if tier is not None else f"model={model}")
+                        if lease is not None and self.legacy_routing in {"native", "turn-state"}:
+                            headers.update(lease.headers(threads=self.legacy_routing == "native"))
+                else:
+                    _validate_siwc_wire_payload(payload)
+                req = urllib.request.Request(
+                    self.base_url + path,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                observed_hash = cache_diagnostics.http_request(
+                    payload, dict(req.header_items()), cast(bytes, req.data), attempt,
+                    lease_decision=lease.decision if lease is not None else None,
+                    new_turn=lease.new_turn if lease is not None else None,
+                    routing_mode=self.legacy_routing if self.backend == "codex" else None,
+                    would_echo=lease.turn_state is not None if lease is not None else None,
+                    history_id=lease.entry.thread_id if lease is not None else None,
+                    active_histories=lease.active_histories if lease is not None else None,
+                    mixed_user_tool=lease.mixed_user_tool if lease is not None else None,
+                    new_turn_v2=lease.new_turn_v2 if lease is not None else None,
+                    rule_disagreement=lease.new_turn != lease.new_turn_v2 if lease is not None else None,
+                )
                 with self._open_request(req, timeout=self.timeout, cancel=cancel,
                                         skip_unauthorized_body=attempt == 0) as response:
                     cache_diagnostics.http_response(payload, getattr(response, "status", None),
                                                     getattr(response, "headers", None), attempt)
                     if lease is not None:
-                        lease.response_headers(response.headers)
+                        self._legacy_routing_call("response_headers", lease.response_headers, response.headers)
                     if catalog_key is not None:
                         self._model_catalog_cache.invalidate_on_etag_mismatch(
                             catalog_key,
@@ -2093,7 +2117,8 @@ class ChatGPTOAuthProvider:
                                     event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
                                     if event is not None:
                                         if lease is not None:
-                                            lease.observe(event)
+                                            self._legacy_routing_call("observe", lease.observe, event,
+                                                                     echoed="x-codex-turn-state" in headers)
                                         if event.get("type") == "response.completed":
                                             eof_kind = "completed"
                                         if event.get("type") in {
@@ -2115,7 +2140,8 @@ class ChatGPTOAuthProvider:
                                 block = []
                                 if event is not None:
                                     if lease is not None:
-                                        lease.observe(event)
+                                        self._legacy_routing_call("observe", lease.observe, event,
+                                                                     echoed="x-codex-turn-state" in headers)
                                     if self.backend == "codex":
                                         reader.event_received()
                                     if event.get("type") == "response.completed":
@@ -2138,6 +2164,10 @@ class ChatGPTOAuthProvider:
             except urllib.error.HTTPError as exc:
                 eof_kind = "http_error"
                 cache_diagnostics.http_response(payload, exc.code, exc.headers, attempt)
+                if (lease is not None and "x-codex-turn-state" in headers
+                        and 400 <= exc.code < 500 and exc.code not in {401, 429}):
+                    lease.reject_turn_state()
+                    diagnostic_emit("turn_state_rejected", status=exc.code, rejection_source="http_status")
                 if exc.code == 401 and attempt == 0:
                     exc.close()
                     self._refresh_after_unauthorized(token)
@@ -2163,7 +2193,7 @@ class ChatGPTOAuthProvider:
                 ) from exc
             finally:
                 if lease is not None:
-                    self._legacy_routing.release(lease)
+                    self._legacy_routing_call("release", self._legacy_routing.release, lease)
                 if cache_diagnostics.diagnostics.enabled():
                     diagnostic_emit(
                         "cache_http_closed", payload_hash=observed_hash, network_attempt=attempt,

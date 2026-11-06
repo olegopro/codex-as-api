@@ -548,6 +548,36 @@ def test_cache_http_fingerprints_final_headers_without_credentials(diagnostic_lo
     assert "canary" not in diagnostic_log.read_text()
 
 
+def test_routing_cookie_has_separate_hash_and_shadow_fields_are_allowlisted(diagnostic_log):
+    headers = {"session-id": "session", "thread-id": "thread", "x-codex-turn-state": "first-canary"}
+    cache_diagnostics.http_request({}, headers, b"{}", 0, routing_mode="shadow", would_echo=True,
+                                   history_id="internal-canary", active_histories=2)
+    headers["x-codex-turn-state"] = "next-canary"
+    cache_diagnostics.http_request({}, headers, b"{}", 0)
+    first, second = records(diagnostic_log)
+    assert first["routing_hash"] != second["routing_hash"]
+    assert first["routing_config_hash"] == second["routing_config_hash"]
+    assert first["routing_mode"] == "shadow" and first["would_echo"] and first["active_histories"] == 2
+    assert len(first["history_hash"]) == 32
+    assert "canary" not in diagnostic_log.read_text()
+
+
+def test_websocket_handshake_presence_does_not_leak_token(diagnostic_log, monkeypatch):
+    from types import SimpleNamespace
+
+    socket = FakeSocket([{"type": "response.completed", "response": {"output": []}}])
+    socket.response = SimpleNamespace(headers={"x-codex-turn-state": "private-handshake-canary"})
+    monkeypatch.setattr(siwc_transport, "connect", lambda *args, **kwargs: socket)
+    pool = SIWCWebSocketPool()
+    try:
+        list(pool.events({"model": "gpt-6-luna", "input": [{"role": "user", "content": "task"}]},
+                         account_id="account", access_token="token", timeout=5))
+    finally:
+        pool.close()
+    assert next(r for r in records(diagnostic_log) if r["stage"] == "websocket_handshake")["turn_state_present"]
+    assert "canary" not in diagnostic_log.read_text()
+
+
 @pytest.mark.parametrize("backend", ["codex", "siwc"])
 def test_cache_http_real_provider_boundary(diagnostic_log, monkeypatch, backend):
     from .test_provider import _BufferedUpstreamResponse, _test_token

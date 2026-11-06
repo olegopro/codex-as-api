@@ -248,7 +248,8 @@ def test_routing_headers_are_observed_without_logging_values(diagnostic_log):
     assert "canary" not in diagnostic_log.read_text()
 
 
-def test_native_turn_state_echo_is_limited_to_tool_continuation(monkeypatch, diagnostic_log):
+@pytest.mark.parametrize("routing", ["observe", "shadow", "turn-state", "native"])
+def test_native_turn_state_echo_is_limited_to_tool_continuation(monkeypatch, diagnostic_log, routing):
     captured = []
     call = {"type": "function_call", "call_id": "c1", "name": "Read", "arguments": "{}"}
     answer = {"role": "assistant", "content": "done"}
@@ -262,16 +263,24 @@ def test_native_turn_state_echo_is_limited_to_tool_continuation(monkeypatch, dia
     second = {**first, "input": [*first["input"], call,
                                  {"type": "function_call_output", "call_id": "c1", "output": "value"}]}
     third = {**first, "input": [*second["input"], answer, {"role": "user", "content": "next"}]}
-    with upstream(monkeypatch, serve, routing="native") as client:
+    with upstream(monkeypatch, serve, routing=routing) as client:
         for body in (first, second, third):
             list(client._post_sse("/responses", body))
     assert "x-codex-turn-state" not in captured[0]
-    assert captured[1]["x-codex-turn-state"] == "route-canary"
+    if routing in {"native", "turn-state"}:
+        assert captured[1]["x-codex-turn-state"] == "route-canary"
+    else:
+        assert "x-codex-turn-state" not in captured[1]
     assert "x-codex-turn-state" not in captured[2]
     assert len({h["thread-id"] for h in captured}) == 1
+    if routing != "native":
+        assert all(h["thread-id"] == h["session-id"] == h["x-client-request-id"] == "s" for h in captured)
+        assert all("x-codex-routing-hint" not in h for h in captured)
     requests = [r for r in records(diagnostic_log) if r["stage"] == "cache_http_request"]
-    assert [r["lease_decision"] for r in requests] == ["new_no_anchor", "reused_replay", "reused_replay"]
-    assert [r["new_turn"] for r in requests] == [True, False, True]
+    if routing != "observe":
+        assert [r["lease_decision"] for r in requests] == ["new_no_anchor", "reused_replay", "reused_replay"]
+        assert [r["new_turn"] for r in requests] == [True, False, True]
+        assert [r["would_echo"] for r in requests] == [False, True, False]
     assert "route-canary" not in diagnostic_log.read_text()
 
 
