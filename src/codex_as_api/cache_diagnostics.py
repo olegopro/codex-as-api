@@ -143,6 +143,8 @@ def observe_events(
                 diagnostics.emit("upstream_created", attempt_id=attempt_id, upstream_response_id=response_id,
                                  elapsed_ms=last_event_ms)
             if kind in {"response.completed", "response.failed", "response.incomplete", "error"}:
+                if kind != "response.completed":
+                    upstream_error(event, payload_hash=payload_hash)
                 usage = response.get("usage")
                 usage = usage if isinstance(usage, dict) else {}
                 details = usage.get("input_tokens_details")
@@ -189,6 +191,34 @@ def observe_events(
                                  elapsed_ms=int(1000 * (time.monotonic() - started)))
 
 
+def upstream_error(value: Any, *, status: int | None = None, payload_hash: str | None = None) -> None:
+    """Machine fields only: unknown code/type/param values are hashed, never printed."""
+    if not diagnostics.enabled():
+        return
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = {}
+    value = value if isinstance(value, dict) else {}
+    response = value.get("response")
+    error = response.get("error") if isinstance(response, dict) else value.get("error")
+    if not isinstance(error, dict):
+        error = value if value.get("type") == "error" else None
+    if not isinstance(error, dict) or not error:
+        return
+    fields: dict[str, Any] = {}
+    for name in ("code", "type", "param"):
+        key = "upstream_error_" + name
+        raw = error.get(name)
+        if isinstance(raw, str) and raw:
+            if raw in diagnostics._ENUMS[key]:
+                fields[key] = raw
+            else:
+                fields[key + "_hash"] = _hash(raw)
+    diagnostics.emit("cache_upstream_error", status=status, payload_hash=payload_hash, **fields)
+
+
 def http_request(
     payload: dict[str, Any], headers: Mapping[str, str], body: bytes, attempt: int,
     *, lease_decision: str | None = None, new_turn: bool | None = None,
@@ -196,6 +226,8 @@ def http_request(
     history_id: str | None = None, active_histories: int | None = None,
     mixed_user_tool: bool | None = None,
     new_turn_v2: bool | None = None, rule_disagreement: bool | None = None,
+    would_echo_token: str | None = None, token_origin: str | None = None, token_age_ms: int | None = None,
+    replay_mismatch_kind: str | None = None,
 ) -> str | None:
     if not diagnostics.enabled():
         return None
@@ -213,6 +245,9 @@ def http_request(
         active_histories=active_histories,
         mixed_user_tool=mixed_user_tool,
         new_turn_v2=new_turn_v2, rule_disagreement=rule_disagreement,
+        would_echo_hash=_hash(would_echo_token) if would_echo_token is not None else None,
+        token_origin_http_id=token_origin, token_age_ms=token_age_ms,
+        replay_mismatch_kind=replay_mismatch_kind,
         wire_hash=hashlib.sha256(body).hexdigest()[:32],
         session_header_hash=_hash(normalized.get("session-id")),
         thread_header_hash=_hash(normalized.get("thread-id")),

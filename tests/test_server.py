@@ -3463,6 +3463,24 @@ def test_openai_plan_usage_limit_keeps_status_and_code(client, monkeypatch):
     assert _PLAN_LIMIT_MESSAGE in error["message"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("terminal", ["error", "response.failed"])
+def test_context_overflow_uses_anthropic_prompt_too_long(client, monkeypatch, stream, terminal):
+    import codex_as_api.server as server_mod
+
+    def failed(_path, _payload, extra_headers=None):
+        error = {"code": "context_length_exceeded", "message": "private-canary"}
+        yield {"type": terminal, **({"error": error} if terminal == "error" else {"response": {"error": error}})}
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", failed)
+    response = client.post("/v1/messages", json={"model": "claude-sonnet-4-5", "max_tokens": 10,
+                           "stream": stream, "messages": [{"role": "user", "content": "hello"}]})
+    if not stream:
+        assert response.status_code == 400
+    assert '"invalid_request_error"' in response.text
+    assert "prompt is too long:" in response.text and "private-canary" not in response.text
+
+
 def test_request_validation_error_does_not_reflect_invalid_input(client):
     response = client.post(
         "/v1/chat/completions",

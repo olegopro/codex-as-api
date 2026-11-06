@@ -344,6 +344,8 @@ async def _anthropic_nonstream_call(
 
 def _error_status(exc: BaseException) -> int:
     if isinstance(exc, ChatGPTOAuthUpstreamError):
+        if exc.code == "context_length_exceeded":
+            return 400
         return exc.status if 100 <= exc.status <= 599 else 500
     if isinstance(exc, ChatGPTOAuthInvalidRequestError):
         return 400
@@ -367,6 +369,8 @@ def _plan_error_code(exc: BaseException) -> str | None:
 
 
 def _error_code(exc: BaseException) -> str:
+    if isinstance(exc, ChatGPTOAuthUpstreamError) and exc.code == "context_length_exceeded":
+        return exc.code
     return _plan_error_code(exc) or _error_type(exc)
 
 
@@ -400,6 +404,8 @@ def _public_error_message(exc: BaseException) -> str:
         return "authenticated model catalog is unavailable"
     if isinstance(exc, ChatGPTOAuthProtocolError):
         return "upstream protocol validation failed"
+    if isinstance(exc, ChatGPTOAuthUpstreamError) and exc.code == "context_length_exceeded":
+        return "prompt is too long: input exceeds the model context window"
     if plan_code is not None:
         return f"{exc} [{plan_code}; usage: ChatGPT Settings > Usage]"
     if isinstance(exc, ChatGPTOAuthUpstreamError):
@@ -609,6 +615,8 @@ def _merge_anthropic_text(
 
 def _error_type(exc: BaseException) -> str:
     if isinstance(exc, ChatGPTOAuthUpstreamError):
+        if exc.code == "context_length_exceeded":
+            return "invalid_request_error"
         return "upstream_error"
     if isinstance(exc, ChatGPTOAuthInvalidRequestError):
         return "invalid_request_error"

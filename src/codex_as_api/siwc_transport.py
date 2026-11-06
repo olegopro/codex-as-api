@@ -17,7 +17,7 @@ from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
-from websockets.exceptions import InvalidStatus, WebSocketException
+from websockets.exceptions import ConnectionClosed, InvalidStatus, PayloadTooBig, WebSocketException
 from websockets.protocol import State
 from websockets.sync.client import connect
 
@@ -28,6 +28,28 @@ from .diagnostics import emit as diagnostic_emit
 from .diagnostics import enabled as diagnostics_enabled
 from .diagnostics import safe_model
 from .strict_json import strict_json_loads
+
+# Native Codex 0.166.0 tungstenite default. Queue/ping policy stays unchanged.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+def _close_details(error: BaseException, socket: Any) -> tuple[int | None, str, str | None]:
+    code = None
+    source = None
+    if isinstance(error, ConnectionClosed):
+        for name in ("rcvd", "sent"):
+            close = getattr(error, name, None)
+            if close is not None:
+                code, source = close.code, "received" if name == "rcvd" else "sent"
+                break
+    if code is None and socket is not None:
+        code = getattr(socket, "close_code", None)
+        source = "socket" if code is not None else None
+    category = ("message_too_large" if code == 1009 or isinstance(error.__cause__, PayloadTooBig)
+                else "timeout" if isinstance(error, TimeoutError)
+                else "connection_closed" if isinstance(error, ConnectionClosed)
+                else "protocol_error" if isinstance(error, WebSocketException) else "transport_error")
+    return code, category, source
 
 SIWC_WEBSOCKET_URL = "wss://api.openai.com/v1/responses"
 _TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
@@ -58,7 +80,7 @@ def _is_output_item(item: dict[str, Any]) -> bool:
     }
 
 
-def _output_key(items: list[dict[str, Any]]) -> bytes:
+def _output_components(items: list[dict[str, Any]]) -> tuple[Any, ...]:
     # Только сравнение replay: wire-ответы и история не меняются. Фасад объединяет
     # текст и выдаёт tools в конце; служебные id/status сообщения в replay исчезают.
     text: list[str] = []
@@ -87,7 +109,11 @@ def _output_key(items: list[dict[str, Any]]) -> bytes:
             calls.append((item.get("call_id"), str(item.get("name", "")).rsplit(".", 1)[-1], arguments))
         else:
             other.append(item)
-    return _fingerprint(("".join(text), reasoning, calls, other))
+    return ("".join(text), reasoning, calls, other)
+
+
+def _output_key(items: list[dict[str, Any]]) -> bytes:
+    return _fingerprint(_output_components(items))
 
 
 @dataclass
@@ -238,6 +264,9 @@ class SIWCWebSocketPool:
         completed = False
         reused = False
         terminal_reason = "interrupted"
+        socket = None
+        close_code = close_category = close_source = None
+        max_message_bytes = 0
         diagnostic_emit("upstream_start", attempt_id=request_id, session_hash=session_hash, branch_hash=key[3][:12],
                         model=payload.get("model"))
         if diagnostics_enabled():
@@ -273,6 +302,7 @@ class SIWCWebSocketPool:
                             user_agent_header=None,
                             open_timeout=min(timeout, 15.0),
                             close_timeout=3.0,
+                            max_size=MAX_MESSAGE_BYTES,
                         ))
                         entry.token_hash = token_hash
                         entry.opened_at = time.monotonic()
@@ -302,6 +332,9 @@ class SIWCWebSocketPool:
                         try:
                             while True:
                                 raw = socket.recv(timeout=timeout)
+                                if diagnostics_enabled():
+                                    message_bytes = len(raw) if isinstance(raw, bytes) else len(raw.encode("utf-8"))
+                                    max_message_bytes = max(max_message_bytes, message_bytes)
                                 try:
                                     event = strict_json_loads(raw)
                                 except (UnicodeDecodeError, ValueError) as exc:
@@ -364,6 +397,7 @@ class SIWCWebSocketPool:
                                         if diagnostics_enabled():
                                             _LOG.info("SIWC WS completed request=%s", request_id)
                                         diagnostic_emit("upstream_completed", attempt_id=request_id,
+                                                        max_message_bytes=max_message_bytes,
                                                         input_tokens=counters[0], cached_tokens=counters[1],
                                                         output_tokens=counters[2],
                                                         total_tokens=(usage.get("total_tokens")
@@ -377,6 +411,7 @@ class SIWCWebSocketPool:
                             if not completed:
                                 entry.close()
                 except InvalidStatus as exc:
+                    close_category = "handshake_error"
                     entry.close()
                     headers = http.client.HTTPMessage()
                     for name, value in exc.response.headers.raw_items():
@@ -386,6 +421,7 @@ class SIWCWebSocketPool:
                         headers, io.BytesIO(exc.response.body),
                     ) from exc
                 except (WebSocketException, TimeoutError, OSError) as exc:
+                    close_code, close_category, close_source = _close_details(exc, socket)
                     entry.close()
                     raise OSError(str(exc)) from exc
         finally:
@@ -393,6 +429,8 @@ class SIWCWebSocketPool:
                 if (context := diagnostic_context()) is not None:
                     context["failed"] = True
                 diagnostic_emit("upstream_error", attempt_id=request_id, reason=terminal_reason,
+                                close_code=close_code, close_category=close_category, close_source=close_source,
+                                max_message_bytes=max_message_bytes,
                                 elapsed_ms=round((time.monotonic() - started) * 1000),
                                 first_event_ms=first_event_ms, first_delta_ms=first_delta_ms, reused=reused)
                 if diagnostics_enabled():
@@ -406,6 +444,8 @@ class SIWCWebSocketPool:
                 entry.users -= 1
                 entry.last_used = time.monotonic()
                 diagnostic_emit("channel_released", attempt_id=request_id, channel_id=channel_id,
+                                close_code=close_code, close_category=close_category, close_source=close_source,
+                                max_message_bytes=max_message_bytes,
                                 reason="completed" if completed else terminal_reason)
 
     def _retire_locked(self, entries: list[_Connection]) -> None:

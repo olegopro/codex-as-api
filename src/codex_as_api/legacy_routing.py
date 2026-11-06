@@ -10,8 +10,33 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import cache_diagnostics
+from .diagnostics import current as diagnostic_context
 from .diagnostics import emit as diagnostic_emit
-from .siwc_transport import _branch_key, _fingerprint, _is_output_item, _output_key
+from .siwc_transport import _branch_key, _fingerprint, _is_output_item, _output_components, _output_key
+
+
+@dataclass(frozen=True)
+class _Replay:
+    key: bytes
+    parts: tuple[bytes, ...]
+    counts: tuple[int, ...]
+    unordered: tuple[tuple[bytes, ...], ...]
+
+    @classmethod
+    def from_output(cls, items: list[dict[str, Any]]) -> _Replay:
+        parts = _output_components(items)
+        return cls(_fingerprint(parts), tuple(_fingerprint(p) for p in parts),
+                   tuple(len(p) for p in parts[1:]),
+                   tuple(tuple(sorted(_fingerprint(i) for i in p)) for p in parts[1:]))
+
+    def mismatch(self, other: _Replay) -> str:
+        if self.counts != other.counts:
+            return "count"
+        if self.parts[0] == other.parts[0] and self.unordered == other.unordered:
+            return "order"
+        changed = [name for name, a, b in zip(("text", "reasoning", "call", "other"),
+                                             self.parts, other.parts, strict=True) if a != b]
+        return changed[0] if len(changed) == 1 else "multiple"
 
 
 @dataclass
@@ -22,6 +47,9 @@ class _Anchor:
     turn_state: str | None
     owner_hash: bytes
     config: bytes
+    replay: _Replay | None = None
+    token_origin: str | None = None
+    token_issued_at: float | None = None
 
 
 @dataclass
@@ -45,6 +73,9 @@ class LegacyLease:
     active_histories: int = 1
     mixed_user_tool: bool = False
     new_turn_v2: bool = True
+    replay_mismatch_kind: str | None = None
+    token_origin: str | None = None
+    token_issued_at: float | None = None
     output: list[dict[str, Any]] = field(default_factory=list)
     completed: bool = False
 
@@ -60,14 +91,18 @@ class LegacyLease:
         if (self.turn_state is None and not self.rejected and isinstance(value, str) and 0 < len(value) <= 8192
                 and all("!" <= ch <= "~" for ch in value)):
             self.turn_state = value
+            self.token_origin = (diagnostic_context() or {}).get("http_id")
+            self.token_issued_at = time.monotonic()
 
     def reject_turn_state(self) -> None:
         previous = self.turn_state
         self.rejected = True
         self.turn_state = None
+        self.token_origin = self.token_issued_at = None
         for anchor in self.entry.anchors:
             if anchor.turn_state == previous:
                 anchor.turn_state = None
+                anchor.token_origin = anchor.token_issued_at = None
 
     def observe(self, event: dict[str, Any], *, echoed: bool = False) -> None:
         response = event.get("response")
@@ -111,6 +146,7 @@ class LegacyRouting:
                 if not old.busy and now - old.used_at >= self._idle_timeout:
                     del self._entries[old_key]
             candidates = []
+            mismatches = []
             group = [(k, v) for k, v in self._entries.items() if k[:3] == key]
             for entry_key, entry in group:
                 if entry.busy:
@@ -136,12 +172,15 @@ class LegacyRouting:
                             # and developer notes continue it. Unknown branches get a lease.
                             new_turn = any(item.get("role") == "user" for item in inputs[size + len(replay):])
                             candidates.append((size, entry_key, index, new_turn, "reused_replay"))
+                        elif anchor.replay is not None:
+                            mismatches.append((size, anchor.replay.mismatch(_Replay.from_output(replay))))
             best_size = max((candidate[0] for candidate in candidates), default=-1)
             best = {(entry_key, index, new_turn, decision) for size, entry_key, index, new_turn, decision in candidates
                     if size == best_size}
             parent = None
             turn_state = None
             new_turn_v2 = True
+            token_origin = token_issued_at = None
             if len(best) == 1:
                 entry_key, index, new_turn, decision = best.pop()
                 entry = self._entries[entry_key]
@@ -163,6 +202,7 @@ class LegacyRouting:
                     new_turn_v2 = not bool(calls and calls <= fulfilled and not (aborted and new_turn))
                 if not new_turn and parent.config == config and parent.owner_hash == owner_hash:
                     turn_state = parent.turn_state
+                    token_origin, token_issued_at = parent.token_origin, parent.token_issued_at
             else:
                 decision = ("new_ambiguous" if best else "new_no_anchor" if not group else
                             "new_busy" if all(v.busy for _, v in group) else "new_replay_mismatch")
@@ -180,23 +220,31 @@ class LegacyRouting:
                     break
                 if not self._entries[old_key].busy:
                     del self._entries[old_key]
+            closest = max((size for size, _ in mismatches), default=-1)
+            kinds = {kind for size, kind in mismatches if size == closest}
+            mismatch = (next(iter(kinds)) if len(kinds) == 1 else "multiple" if kinds else "unknown")
             return LegacyLease(entry, (len(history), history[-1]), decision, new_turn,
                                owner_hash, config, turn_state, active_histories=sum(
                                    v.busy for k, v in self._entries.items() if k[:2] == key[:2]),
                                mixed_user_tool=bool(new_turn and parent is not None and any(
                                    item.get("type") == "function_call_output" for item in inputs[parent.size:])),
-                               new_turn_v2=new_turn_v2)
+                               new_turn_v2=new_turn_v2,
+                               replay_mismatch_kind=mismatch if decision == "new_replay_mismatch" else None,
+                               token_origin=token_origin, token_issued_at=token_issued_at)
 
     def release(self, lease: LegacyLease) -> None:
         output_key = None
+        replay = None
         try:
             # Provider validation owns the original error; cleanup must not mask it.
             with suppress(TypeError, ValueError, KeyError, AttributeError):
-                output_key = _output_key(lease.output) if lease.completed else None
+                replay = _Replay.from_output(lease.output) if lease.completed else None
+                output_key = replay.key if replay else None
         finally:
             with self._lock:
                 lease.entry.anchors.append(_Anchor(*lease.history, output_key, lease.turn_state,
-                                                   lease.owner_hash, lease.config))
+                                                   lease.owner_hash, lease.config, replay,
+                                                   lease.token_origin, lease.token_issued_at))
                 lease.entry.busy = False
                 lease.entry.used_at = time.monotonic()
             lease.output.clear()

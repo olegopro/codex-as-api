@@ -75,6 +75,24 @@ def send(handler, event):
     handler.wfile.flush()
 
 
+def test_reader_separates_upstream_read_wait_from_consumer_delay(monkeypatch):
+    clock = [0.0]
+    lines = iter((b"data: {}\n", b": keepalive\n"))
+
+    class Response:
+        def readline(self):
+            clock[0] += .125
+            return next(lines)
+
+    monkeypatch.setattr(provider_module.time, "monotonic", lambda: clock[0])
+    reader = provider_module._LegacySSEReader(Response(), 10, started=0)
+    assert reader.readline() == b"data: {}\n"
+    clock[0] += .45
+    assert reader.readline() == b": keepalive\n"
+    assert reader.timings() == {"max_read_wait_ms": 125, "max_consumer_gap_ms": 450, "last_keepalive_ms": 700}
+    reader.close()
+
+
 @pytest.fixture()
 def tls_pair(tmp_path):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)

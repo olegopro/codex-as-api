@@ -31,6 +31,63 @@ def complete(pool, lease, *output):
     pool.release(lease)
 
 
+def test_token_provenance_survives_continuation_but_not_a_new_turn(monkeypatch):
+    pool = LegacyRouting()
+    import codex_as_api.legacy_routing as routing
+    monkeypatch.setattr(routing, "diagnostic_context", lambda: {"http_id": "a" * 32})
+    first = reserve(pool)
+    complete(pool, first, CALL)
+    second = reserve(pool, payload(USER, CALL, RESULT))
+    assert second.token_origin == "a" * 32 and second.token_issued_at == first.token_issued_at
+    second.response_headers({"x-codex-turn-state": "ignored-second-token"})
+    assert second.turn_state == "sticky-token" and second.token_origin == first.token_origin
+    complete(pool, second, {"role": "assistant", "content": "done"})
+    third = reserve(pool, payload(USER, CALL, RESULT, {"role": "assistant", "content": "done"},
+                                  {"role": "user", "content": "next"}))
+    assert third.turn_state is None and third.token_origin is None and third.token_issued_at is None
+    pool.release(third)
+
+
+def test_successful_replay_does_not_compute_mismatch_details_under_lock(monkeypatch):
+    from codex_as_api.legacy_routing import _Replay
+
+    pool = LegacyRouting()
+    first = reserve(pool)
+    complete(pool, first, CALL)
+
+    def unexpected(_items):
+        raise AssertionError("mismatch-only hashing on a successful replay")
+
+    monkeypatch.setattr(_Replay, "from_output", unexpected)
+    continuation = reserve(pool, payload(USER, CALL, RESULT))
+    assert continuation.decision == "reused_replay" and continuation.turn_state == "sticky-token"
+    pool.release(continuation)
+
+
+@pytest.mark.parametrize("kind", ["count", "order", "reasoning", "text", "call"])
+def test_replay_mismatch_reports_only_the_changed_component(kind):
+    pool = LegacyRouting()
+    first = reserve(pool)
+    output = [{"type": "reasoning", "id": "r1", "encrypted_content": "cipher", "summary": []},
+              {"role": "assistant", "content": "answer"}, CALL, {**CALL, "call_id": "call_2"}]
+    complete(pool, first, *output)
+    changed = deepcopy(output)
+    if kind == "count":
+        changed.pop()
+    elif kind == "order":
+        changed[-2:] = reversed(changed[-2:])
+    elif kind == "reasoning":
+        changed[0]["encrypted_content"] = "different"
+    elif kind == "text":
+        changed[1]["content"] = "different"
+    else:
+        changed[2]["arguments"] = '{"changed":true}'
+    second = reserve(pool, payload(USER, *changed, RESULT))
+    assert second.decision == "new_replay_mismatch" and second.replay_mismatch_kind == kind
+    assert second.turn_state is None
+    pool.release(second)
+
+
 def test_continuation_preserves_turn_but_new_user_resets_it():
     pool = LegacyRouting()
     first = reserve(pool)

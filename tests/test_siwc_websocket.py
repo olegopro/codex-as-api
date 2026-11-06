@@ -95,6 +95,8 @@ def test_siwc_default_websocket_reuses_session_and_sends_full_stateless_input(we
     assert options["additional_headers"] == {"Authorization": "Bearer synthetic-access"}
     assert options["proxy"] == "http://127.0.0.1:8110"
     assert options["user_agent_header"] is None
+    assert options["max_size"] == 64 * 1024 * 1024
+    assert not {"max_queue", "ping_interval", "ping_timeout"} & options.keys()
     for payload in sockets[0].sent:
         assert payload["type"] == "response.create" and payload["store"] is False
         assert payload["input"][-1]["role"] == "user"

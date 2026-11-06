@@ -36,6 +36,27 @@ def records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_upstream_machine_error_allowlist_never_records_unknown_content(diagnostic_log, wrapped):
+    error = {"code": "context_length_exceeded", "type": "invalid_request_error", "param": "input",
+             "message": "private-canary"}
+    cache_diagnostics.upstream_error({"response": {"error": error}} if wrapped else {"error": error})
+    cache_diagnostics.upstream_error(json.dumps({"error": {
+        "code": "private-canary", "type": "private-canary", "param": "private-canary"}}), status=400)
+    known, unknown = records(diagnostic_log)
+    assert known["upstream_error_code"] == "context_length_exceeded"
+    assert known["upstream_error_type"] == "invalid_request_error" and known["upstream_error_param"] == "input"
+    assert unknown["status"] == 400 and len(unknown["upstream_error_code_hash"]) == 32
+    assert "upstream_error_code" not in unknown
+    assert "private-canary" not in diagnostic_log.read_text()
+
+
+def test_incomplete_without_error_does_not_create_a_machine_error(diagnostic_log):
+    cache_diagnostics.upstream_error({"type": "response.incomplete", "response": {
+        "incomplete_details": {"reason": "max_output_tokens"}}})
+    assert records(diagnostic_log) == []
+
+
 def test_disabled_and_invalid_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("CODEX_AS_API_DIAGNOSTICS", raising=False)
     monkeypatch.setenv("CODEX_AS_API_DIAGNOSTICS_PATH", str(tmp_path / "unused"))

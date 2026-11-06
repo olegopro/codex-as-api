@@ -437,7 +437,7 @@ class _SSEIdleTimeoutError(TimeoutError):
 class _LegacySSEReader:
     """Bound time between SSE events, even when comments or partial lines arrive."""
 
-    def __init__(self, response: Any, timeout: float) -> None:
+    def __init__(self, response: Any, timeout: float, *, started: float | None = None) -> None:
         self.response = response
         self.socket = _response_socket(response)
         self.timeout = timeout
@@ -447,6 +447,10 @@ class _LegacySSEReader:
         self._closed = False
         self._condition = threading.Condition()
         self._watcher = None
+        self.started = time.monotonic() if started is None else started
+        self._last_exit = time.monotonic()
+        self.max_read_wait_ms = self.max_consumer_gap_ms = 0
+        self.last_keepalive_ms: int | None = None
         if self.socket is not None:
             # One request-scoped waiter; recv timeouts alone are extended by
             # heartbeat bytes and may be reset internally by HTTP transports.
@@ -480,20 +484,38 @@ class _LegacySSEReader:
             self._watcher.join()
 
     def readline(self) -> bytes:
+        self.max_consumer_gap_ms = max(self.max_consumer_gap_ms,
+                                      round(1000 * (time.monotonic() - self._last_exit)))
+        try:
+            line = self._readline()
+            if line.startswith(b":"):
+                self.last_keepalive_ms = round(1000 * (time.monotonic() - self.started))
+            return line
+        finally:
+            self._last_exit = time.monotonic()
+
+    def timings(self) -> dict[str, int | None]:
+        return {"max_read_wait_ms": self.max_read_wait_ms, "max_consumer_gap_ms": self.max_consumer_gap_ms,
+                "last_keepalive_ms": self.last_keepalive_ms}
+
+    def _readline(self) -> bytes:
         while b"\n" not in self.buffer:
             remaining = self.deadline - time.monotonic()
             if self.expired or remaining <= 0:
                 raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE")
             read1 = getattr(self.response, "read1", None)
-            if self.socket is None or not callable(read1):
-                return cast(bytes, self.response.readline())
-            self.socket.settimeout(remaining)
+            started = time.monotonic()
             try:
+                if self.socket is None or not callable(read1):
+                    return cast(bytes, self.response.readline())
+                self.socket.settimeout(remaining)
                 chunk = read1(64 * 1024)
             except (OSError, httpx.HTTPError) as exc:
                 if self.expired or time.monotonic() >= self.deadline:
                     raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE") from exc
                 raise
+            finally:
+                self.max_read_wait_ms = max(self.max_read_wait_ms, round(1000 * (time.monotonic() - started)))
             if self.expired:
                 raise _SSEIdleTimeoutError("Upstream idle timeout waiting for SSE")
             if not chunk:
@@ -538,7 +560,9 @@ def _http_error_body(
         body = raw.decode("utf-8", "replace")
     except (OSError, ValueError, TimeoutError, http.client.HTTPException):
         return "could not read upstream error body"
-    return redact_text(body, *token_values)
+    redacted = redact_text(body, *token_values)
+    cache_diagnostics.upstream_error(redacted, status=exc.code)
+    return redacted
 
 
 # Отказы плана SIWC и их HTTP-статусы по Errors and recovery; `response.failed`
@@ -2046,6 +2070,7 @@ class ChatGPTOAuthProvider:
             close_started = None
             wire_counts = {"upstream_bytes": 0, "upstream_lines": 0, "keepalive_lines": 0}
             eof_kind = "transport_error"
+            reader = None
             try:
                 if self.backend == "codex":
                     headers["Accept"] = "text/event-stream"
@@ -2086,6 +2111,11 @@ class ChatGPTOAuthProvider:
                     mixed_user_tool=lease.mixed_user_tool if lease is not None else None,
                     new_turn_v2=lease.new_turn_v2 if lease is not None else None,
                     rule_disagreement=lease.new_turn != lease.new_turn_v2 if lease is not None else None,
+                    would_echo_token=lease.turn_state if lease is not None else None,
+                    token_origin=lease.token_origin if lease is not None else None,
+                    token_age_ms=(round(1000 * (time.monotonic() - lease.token_issued_at))
+                                  if lease is not None and lease.token_issued_at is not None else None),
+                    replay_mismatch_kind=lease.replay_mismatch_kind if lease is not None else None,
                 )
                 with self._open_request(req, timeout=self.timeout, cancel=cancel,
                                         skip_unauthorized_body=attempt == 0) as response:
@@ -2101,7 +2131,8 @@ class ChatGPTOAuthProvider:
                     with self._active_response_lock:
                         self._active_responses.add(response)
                     block: list[str] = []
-                    reader = _LegacySSEReader(response, self.timeout) if self.backend == "codex" else response
+                    reader = (_LegacySSEReader(response, self.timeout, started=wire_started)
+                              if self.backend == "codex" else response)
                     try:
                         while True:
                             raw_line = reader.readline()
@@ -2198,6 +2229,7 @@ class ChatGPTOAuthProvider:
                     diagnostic_emit(
                         "cache_http_closed", payload_hash=observed_hash, network_attempt=attempt,
                         eof_kind=eof_kind, **wire_counts,
+                        **(reader.timings() if isinstance(reader, _LegacySSEReader) else {}),
                         elapsed_ms=round(1000 * (time.monotonic() - wire_started)),
                         close_ms=(round(1000 * (time.monotonic() - close_started))
                                   if close_started is not None else None),
