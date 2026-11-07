@@ -97,7 +97,8 @@ def test_siwc_default_websocket_reuses_session_and_sends_full_stateless_input(we
     assert options["proxy"] == "http://127.0.0.1:8110"
     assert options["user_agent_header"] is None
     assert options["max_size"] == 64 * 1024 * 1024
-    assert not {"max_queue", "ping_interval", "ping_timeout"} & options.keys()
+    assert options["ping_timeout"] == 60.0
+    assert "max_queue" not in options and "ping_interval" not in options
     for payload in sockets[0].sent:
         assert payload["type"] == "response.create" and payload["store"] is False
         assert payload["input"][-1]["role"] == "user"
@@ -701,6 +702,36 @@ def test_rotated_channel_rejection_is_replayed_once_on_a_new_socket(websocket_pr
     assert provider.chat(test_siwc_provider._messages()).content == "Ответ"
     assert len(calls) == 2 and sockets[0].closed and len(sockets[1].sent) == 1
     assert calls[-1][1]["additional_headers"]["Authorization"] == "Bearer synthetic-new-access"
+
+
+def test_refused_connect_is_retried_within_the_request(websocket_provider, monkeypatch):
+    delays = []
+    monkeypatch.setattr(siwc_transport.time, "sleep", delays.append)
+
+    def handshake(attempt):
+        if attempt < 3:
+            raise ConnectionRefusedError("synthetic proxy restart")
+
+    provider, sockets, calls, _ = websocket_provider(handshake=handshake)
+    assert provider.chat(test_siwc_provider._messages()).content == "Ответ"
+    assert len(calls) == 3 and delays == [0.5, 1.0] and len(sockets) == 1 and len(sockets[0].sent) == 1
+
+
+def test_persistent_connect_failure_returns_after_the_retry_window(websocket_provider, monkeypatch):
+    clock, events = [1000.0], []
+    monkeypatch.setattr(siwc_transport.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(siwc_transport.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(siwc_transport, "diagnostic_emit",
+                        lambda stage, **fields: events.append({"stage": stage, **fields}))
+
+    def handshake(_attempt):
+        raise ConnectionRefusedError("synthetic proxy down")
+
+    provider, sockets, calls, _ = websocket_provider(handshake=handshake)
+    with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
+        provider.chat(test_siwc_provider._messages())
+    assert caught.value.status == 502 and not sockets and len(calls) == 8 and clock[0] == 1019.5
+    assert [e["reason"] for e in events if e["stage"] == "upstream_error"] == ["connect_failed"]
 
 
 def test_same_token_channel_rejection_is_not_replayed(websocket_provider):

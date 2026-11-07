@@ -60,6 +60,38 @@ class StaleSocketError(Exception):
     """A channel opened with an earlier token failed before its first event; nothing was yielded."""
 
 
+_CONNECT_RETRY_SECONDS = 20.0
+
+
+def _connect(access_token: str, timeout: float, cancel: Any) -> tuple[Any, int]:
+    # A restarting proxy or tunnel refuses for seconds. Nothing has been sent yet,
+    # so the handshake is retried within the request instead of returning 502.
+    deadline = time.monotonic() + min(timeout, _CONNECT_RETRY_SECONDS)
+    delay, attempts = 0.5, 0
+    while True:
+        attempts += 1
+        try:
+            return connect(
+                SIWC_WEBSOCKET_URL,
+                additional_headers={"Authorization": f"Bearer {access_token}"},
+                proxy=os.getenv("https_proxy") or os.getenv("HTTPS_PROXY"),
+                user_agent_header=None,
+                open_timeout=min(timeout, 15.0),
+                close_timeout=3.0,
+                ping_timeout=60.0,
+                max_size=MAX_MESSAGE_BYTES,
+            ), attempts
+        except InvalidStatus:
+            raise
+        except (WebSocketException, TimeoutError, OSError):
+            if time.monotonic() + delay >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 4.0)
+            if cancel is not None:
+                cancel.check()
+
+
 def _branch_key(payload: dict[str, Any]) -> str:
     # Claude Code gives siblings the parent's session ID. The initial user turn
     # and instructions distinguish their histories without retaining prompt text.
@@ -375,18 +407,12 @@ class SIWCWebSocketPool:
                         connection_reason = "socket_closed"
                     else:
                         connection_reason = "connection_expired"
+                    connect_attempts = 0
                     if not reused:
                         entry.close()
                         channel_id = entry.channel_id
-                        entry.socket = entry.stack.enter_context(connect(
-                            SIWC_WEBSOCKET_URL,
-                            additional_headers={"Authorization": f"Bearer {access_token}"},
-                            proxy=os.getenv("https_proxy") or os.getenv("HTTPS_PROXY"),
-                            user_agent_header=None,
-                            open_timeout=min(timeout, 15.0),
-                            close_timeout=3.0,
-                            max_size=MAX_MESSAGE_BYTES,
-                        ))
+                        connection, connect_attempts = _connect(access_token, timeout, cancel)
+                        entry.socket = entry.stack.enter_context(connection)
                         entry.token_hash = token_hash
                         entry.opened_at = time.monotonic()
                         handshake = getattr(entry.socket, "response", None)
@@ -396,7 +422,8 @@ class SIWCWebSocketPool:
                                             turn_state_present="x-codex-turn-state" in handshake_headers)
                     diagnostic_emit("upstream_start", attempt_id=request_id, channel_id=entry.channel_id,
                                     reused=reused, reason=connection_reason, token_rotated=rotated,
-                                    socket_age_ms=round((time.monotonic() - entry.opened_at) * 1000))
+                                    socket_age_ms=round((time.monotonic() - entry.opened_at) * 1000),
+                                    network_attempt=connect_attempts)
                     socket = entry.socket
 
                     def stop() -> None:
@@ -514,6 +541,8 @@ class SIWCWebSocketPool:
                     ) from exc
                 except (WebSocketException, TimeoutError, OSError) as exc:
                     close_code, close_category, close_source = _close_details(exc, socket)
+                    if socket is None:
+                        terminal_reason = "connect_failed"
                     entry.close()
                     if (rotated and not yielded and isinstance(exc, ConnectionClosed)
                             and not (cancel is not None and cancel.cancelled)):

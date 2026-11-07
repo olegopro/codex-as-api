@@ -211,7 +211,7 @@ _ENUMS = {
     "transport": {"http", "websocket"},
     "reason": {"invalid_json", "invalid_content_type", "body_too_large", "invalid_request", "thinking_display_invalid",
                "no_socket", "socket_closed", "credentials_changed", "connection_expired", "reused", "upstream_failed",
-               "upstream_incomplete", "upstream_error", "interrupted", "stream_error", "completed",
+               "upstream_incomplete", "upstream_error", "interrupted", "stream_error", "completed", "connect_failed",
                "search_unavailable", "search_timeout", "search_failed"},
     "selection_reason": {"new", "existing", "input_mismatch", "missing_key", "replay_mismatch"},
     "wait_outcome": {"not_needed", "acquired", "timeout", "cancelled", "capacity", "affinity_lost", "error"},
