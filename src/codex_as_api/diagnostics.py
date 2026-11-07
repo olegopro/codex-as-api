@@ -232,7 +232,8 @@ _NUMBERS = {"active_histories", "status", "elapsed_ms", "first_event_ms", "first
             "network_attempt", "fingerprint_version", "cache_write_tokens", "cache_write_input_tokens",
             "cache_write_ttl_30m_tokens", "cache_write_ttl_12h_tokens", "event_count", "last_event_ms",
             "upstream_bytes", "upstream_lines", "keepalive_lines", "cancel_ms", "close_ms", "token_age_ms",
-            "max_read_wait_ms", "max_consumer_gap_ms", "last_keepalive_ms", "close_code", "max_message_bytes"}
+            "max_read_wait_ms", "max_consumer_gap_ms", "last_keepalive_ms", "close_code", "max_message_bytes",
+            "socket_age_ms"}
 _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
                 "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
@@ -275,7 +276,7 @@ def emit(stage: str, **fields: Any) -> None:
                 and all(char in "0123456789abcdef" for char in value))
             or (key in {"would_echo", "reused", "stream", "usage_available", "cache_write_usage_available",
                         "turn_state_present", "routing_hint_present", "socket_shutdown", "new_turn", "mixed_user_tool",
-                        "new_turn_v2", "rule_disagreement"}
+                        "new_turn_v2", "rule_disagreement", "token_rotated"}
                 and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)

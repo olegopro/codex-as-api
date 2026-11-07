@@ -119,7 +119,7 @@ def test_default_wait_covers_fifteen_seconds_but_not_twenty_five(monkeypatch, re
                 entry.users = 0
 
         monkeypatch.setattr(pool._condition, "wait", wait)
-        selected = pool._reserve(key[:4], MAIN, "continuation", token_hash=entry.token_hash, timeout=60)
+        selected = pool._reserve(key[:4], MAIN, "continuation", timeout=60)
         assert waits == [20]
         assert (selected is entry) == (expected == "acquired")
         assert events[-2]["wait_outcome"] == expected
@@ -177,16 +177,32 @@ def test_wait_is_woken_by_cancel_or_pool_shutdown(contention, stop):
         pool.close()
 
 
-@pytest.mark.parametrize("why", ["small", "capacity", "token", "expired", "closed"])
+def test_refreshed_token_still_waits_for_the_warm_sibling(contention):
+    create, sockets, events, entered = contention
+    pool, sibling = create()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: list(pool.events({"input": MAIN},
+                                                              **{**OPTIONS, "access_token": "refreshed"})))
+            assert entered.wait(1) and not future.done()
+            list(sibling)
+            assert future.result(timeout=2)[-1]["type"] == "response.completed"
+        assert len(sockets) == 1 and [p["input"] for p in sockets[0].sent] == [ROOT, SIBLING, MAIN]
+        started = [e for e in events if e["stage"] == "upstream_start" and "reused" in e][-1]
+        assert started["reused"] and started["token_rotated"] and started["reason"] == "reused"
+    finally:
+        sibling.close()
+        pool.close()
+
+
+@pytest.mark.parametrize("why", ["small", "capacity", "expired", "closed"])
 def test_unhelpful_or_unavailable_wait_never_delays_a_request(contention, why):
     create, sockets, events, entered = contention
     pool, sibling = create(tokens=20 if why == "small" else 64000,
                            max_waiters=0 if why == "capacity" else 8)
     options = dict(OPTIONS)
     connection = next(iter(pool._connections.values()))
-    if why == "token":
-        options["access_token"] = "refreshed"
-    elif why == "expired":
+    if why == "expired":
         connection.opened_at -= 3301
     elif why == "closed":
         sockets[0].close()

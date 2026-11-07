@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from websockets.datastructures import Headers
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.frames import Close
 from websockets.http11 import Response
 from websockets.protocol import State
 
@@ -672,15 +673,43 @@ def test_siwc_websocket_refreshes_only_rejected_handshake(websocket_provider, mo
     assert len(refreshed) == 1 and len(calls) == 2 and len(sockets[0].sent) == 1
 
 
-def test_siwc_websocket_rotated_token_reopens_connection(websocket_provider, monkeypatch):
-    provider, sockets, calls, _ = websocket_provider()
-    provider.chat(test_siwc_provider._messages())
+def _rotate_token(monkeypatch):
     replacement = test_siwc_provider._token()
     replacement.access_token = "synthetic-new-access"
     monkeypatch.setattr(provider_module, "token_for_request", lambda *_args, **_kwargs: replacement)
+
+
+def test_siwc_websocket_rotated_token_keeps_open_connection(websocket_provider, monkeypatch):
+    provider, sockets, calls, _ = websocket_provider()
     provider.chat(test_siwc_provider._messages())
-    assert len(calls) == 2 and sockets[0].closed
+    _rotate_token(monkeypatch)
+    provider.chat(test_siwc_provider._messages())
+    assert len(calls) == 1 and not sockets[0].closed and len(sockets[0].sent) == 2
+    sockets[0].close()
+    provider.chat(test_siwc_provider._messages())
+    assert len(calls) == 2
     assert calls[-1][1]["additional_headers"]["Authorization"] == "Bearer synthetic-new-access"
+
+
+@pytest.mark.parametrize("rejection", [{"type": "error", "error": {"message": "synthetic-access"}},
+                                       ConnectionClosedError(Close(1008, ""), None)])
+def test_rotated_channel_rejection_is_replayed_once_on_a_new_socket(websocket_provider, monkeypatch, rejection):
+    provider, sockets, calls, _ = websocket_provider()
+    provider.chat(test_siwc_provider._messages())
+    sockets[0].events = [rejection]
+    _rotate_token(monkeypatch)
+    assert provider.chat(test_siwc_provider._messages()).content == "Ответ"
+    assert len(calls) == 2 and sockets[0].closed and len(sockets[1].sent) == 1
+    assert calls[-1][1]["additional_headers"]["Authorization"] == "Bearer synthetic-new-access"
+
+
+def test_same_token_channel_rejection_is_not_replayed(websocket_provider):
+    provider, sockets, calls, _ = websocket_provider()
+    provider.chat(test_siwc_provider._messages())
+    sockets[0].events = [{"type": "error", "error": {"message": "synthetic-access"}}]
+    with pytest.raises((ChatGPTOAuthProtocolError, ChatGPTOAuthUpstreamError)):
+        provider.chat(test_siwc_provider._messages())
+    assert len(calls) == 1 and sockets[0].closed and len(sockets[0].sent) == 2
 
 
 def test_closed_idle_socket_is_reopened_before_sending_a_new_request(websocket_provider):

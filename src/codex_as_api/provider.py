@@ -2028,6 +2028,8 @@ class ChatGPTOAuthProvider:
             if path != "/responses":
                 raise ChatGPTOAuthInvalidRequestError("SIWC WebSocket supports only /responses")
             _validate_siwc_wire_payload(payload)
+            from .siwc_transport import StaleSocketError
+
             for attempt in range(2):
                 token = self._token_for_request()
                 _require_catalog_account(token.account_id, catalog_key)
@@ -2041,6 +2043,11 @@ class ChatGPTOAuthProvider:
                             event = _redact_failure_event(event, ws_token_values)
                         yield event
                     return
+                except StaleSocketError as exc:
+                    # Nothing was yielded: one replay on a socket opened with the current token.
+                    if attempt == 0:
+                        continue
+                    raise ChatGPTOAuthUpstreamError(502, "SIWC WebSocket rejected a refreshed channel") from exc
                 except urllib.error.HTTPError as exc:
                     if exc.code == 401 and attempt == 0:
                         exc.close()

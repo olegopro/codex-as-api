@@ -56,6 +56,10 @@ _TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response
 _LOG = logging.getLogger(__name__)
 
 
+class StaleSocketError(Exception):
+    """A channel opened with an earlier token failed before its first event; nothing was yielded."""
+
+
 def _branch_key(payload: dict[str, Any]) -> str:
     # Claude Code gives siblings the parent's session ID. The initial user turn
     # and instructions distinguish their histories without retaining prompt text.
@@ -188,7 +192,7 @@ class SIWCWebSocketPool:
             self._condition.notify_all()
 
     def _reserve(self, key: tuple[str, str, str, str], inputs: list[dict[str, Any]],
-                 request_id: str, *, token_hash: str, timeout: float, cancel: Any = None) -> _Connection:
+                 request_id: str, *, timeout: float, cancel: Any = None) -> _Connection:
         expired = []
         history = tuple(_fingerprint(item) for item in inputs)
         replay_keys: dict[int, bytes] = {}
@@ -250,7 +254,7 @@ class SIWCWebSocketPool:
                     best = max(((score[0], k) for score, k, v in candidates if v.users == 0),
                                key=lambda candidate: candidate[0], default=(-1, None))
                     busy = max((score for score, _, v in candidates if v.users
-                                and v.socket is not None and v.token_hash == token_hash
+                                and v.socket is not None and v.token_hash
                                 and getattr(v.socket, "state", State.OPEN) == State.OPEN
                                 and now - v.opened_at < 3300.0), default=(-1, 0))
                     should_wait = busy[0] > max(0, best[0]) and busy[1] >= 32000
@@ -332,8 +336,7 @@ class SIWCWebSocketPool:
                payload.get("model", ""), _branch_key(payload))
         request_id = uuid.uuid4().hex[:12]
         token_hash = hashlib.sha256(access_token.encode()).hexdigest()
-        entry = self._reserve(key, payload.get("input", []), request_id,
-                              token_hash=token_hash, timeout=timeout, cancel=cancel)
+        entry = self._reserve(key, payload.get("input", []), request_id, timeout=timeout, cancel=cancel)
         history = entry.history
         channel_id = entry.channel_id
         output: list[dict[str, Any]] = []
@@ -341,7 +344,7 @@ class SIWCWebSocketPool:
         started = time.monotonic()
         first_event_ms = first_delta_ms = None
         completed = False
-        reused = False
+        reused = rotated = yielded = False
         terminal_reason = "interrupted"
         socket = None
         close_code = close_category = close_source = None
@@ -358,17 +361,18 @@ class SIWCWebSocketPool:
                 try:
                     if cancel is not None:
                         cancel.check()
+                    # The token authenticates only the handshake: a refresh keeps an open socket.
+                    # An empty token_hash marks a channel invalidated by stop() or close().
                     reused = (entry.socket is not None and getattr(entry.socket, "state", State.OPEN) == State.OPEN
-                              and entry.token_hash == token_hash
+                              and bool(entry.token_hash)
                               and time.monotonic() - entry.opened_at < 3300.0)
+                    rotated = reused and entry.token_hash != token_hash
                     if reused:
                         connection_reason = "reused"
                     elif entry.socket is None:
                         connection_reason = "no_socket"
-                    elif getattr(entry.socket, "state", State.OPEN) != State.OPEN:
+                    elif getattr(entry.socket, "state", State.OPEN) != State.OPEN or not entry.token_hash:
                         connection_reason = "socket_closed"
-                    elif entry.token_hash != token_hash:
-                        connection_reason = "credentials_changed"
                     else:
                         connection_reason = "connection_expired"
                     if not reused:
@@ -391,7 +395,8 @@ class SIWCWebSocketPool:
                             diagnostic_emit("websocket_handshake", channel_id=entry.channel_id,
                                             turn_state_present="x-codex-turn-state" in handshake_headers)
                     diagnostic_emit("upstream_start", attempt_id=request_id, channel_id=entry.channel_id,
-                                    reused=reused, reason=connection_reason)
+                                    reused=reused, reason=connection_reason, token_rotated=rotated,
+                                    socket_age_ms=round((time.monotonic() - entry.opened_at) * 1000))
                     socket = entry.socket
 
                     def stop() -> None:
@@ -434,6 +439,8 @@ class SIWCWebSocketPool:
                                     terminal_reason = {"response.failed": "upstream_failed",
                                                        "response.incomplete": "upstream_incomplete",
                                                        "error": "upstream_error"}.get(event["type"], "interrupted")
+                                    if rotated and not yielded and event["type"] == "error":
+                                        raise StaleSocketError("SIWC rejected a channel with an earlier token")
                                     if completed:
                                         response = event.get("response")
                                         final_output = response.get("output") if isinstance(response, dict) else None
@@ -490,6 +497,7 @@ class SIWCWebSocketPool:
                                                         first_delta_ms=first_delta_ms, reused=reused)
                                     yield event
                                     return
+                                yielded = True
                                 yield event
                         finally:
                             if not completed:
@@ -507,6 +515,9 @@ class SIWCWebSocketPool:
                 except (WebSocketException, TimeoutError, OSError) as exc:
                     close_code, close_category, close_source = _close_details(exc, socket)
                     entry.close()
+                    if (rotated and not yielded and isinstance(exc, ConnectionClosed)
+                            and not (cancel is not None and cancel.cancelled)):
+                        raise StaleSocketError(str(exc)) from exc
                     raise OSError(str(exc)) from exc
         finally:
             if not completed:
