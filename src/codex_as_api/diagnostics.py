@@ -212,7 +212,7 @@ _ENUMS = {
     "reason": {"invalid_json", "invalid_content_type", "body_too_large", "invalid_request", "thinking_display_invalid",
                "no_socket", "socket_closed", "credentials_changed", "connection_expired", "reused", "upstream_failed",
                "upstream_incomplete", "upstream_error", "interrupted", "stream_error", "completed", "connect_failed",
-               "search_unavailable", "search_timeout", "search_failed"},
+               "drained", "search_unavailable", "search_timeout", "search_failed"},
     "selection_reason": {"new", "existing", "input_mismatch", "missing_key", "replay_mismatch"},
     "wait_outcome": {"not_needed", "acquired", "timeout", "cancelled", "capacity", "affinity_lost", "error"},
     "output_key_source": {"done", "completed"},
@@ -276,7 +276,7 @@ def emit(stage: str, **fields: Any) -> None:
                 and all(char in "0123456789abcdef" for char in value))
             or (key in {"would_echo", "reused", "stream", "usage_available", "cache_write_usage_available",
                         "turn_state_present", "routing_hint_present", "socket_shutdown", "new_turn", "mixed_user_tool",
-                        "new_turn_v2", "rule_disagreement", "token_rotated"}
+                        "new_turn_v2", "rule_disagreement", "token_rotated", "drained"}
                 and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)

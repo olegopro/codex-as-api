@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -857,6 +858,118 @@ def test_cancel_after_completed_event_keeps_the_warm_channel(monkeypatch):
         # The SSE consumer may disconnect before resuming the upstream generator.
         cancel.cancel()
         assert not sockets[0].closed
+    finally:
+        events.close()
+        pool.close()
+
+
+LARGE_INPUT = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x" * (130 * 1024)}]}]
+AFTER_INTERRUPT = LARGE_INPUT + [
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]},
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "[Request interrupted by user]"}]},
+]
+
+
+class SilentSocket(FakeSocket):
+    def __init__(self, events):
+        super().__init__(events)
+        self.closing = threading.Event()
+
+    def close(self):
+        super().close()
+        self.closing.set()
+
+    def recv(self, *, timeout):
+        if self.pending:
+            return super().recv(timeout=timeout)
+        if self.closing.wait(timeout):
+            raise ConnectionClosedError(None, None)
+        raise TimeoutError
+
+
+def _cancelled_pool(monkeypatch, tail, socket_type=FakeSocket):
+    sockets = []
+
+    def connect(*_args, **_kwargs):
+        sock = socket_type([{"type": "response.created"}, *tail])
+        sockets.append(sock)
+        return sock
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    cancel = provider_module._RequestCancellation()
+    events = pool.events({"prompt_cache_key": "one", "input": LARGE_INPUT}, account_id="account",
+                         access_token="synthetic", timeout=1, cancel=cancel)
+    assert next(events)["type"] == "response.created"
+    cancel.cancel()
+    events.close()
+    deadline = time.monotonic() + 2
+    while pool.active_requests and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert pool.active_requests == 0
+    return pool, sockets
+
+
+def test_cancelled_large_answer_is_drained_and_keeps_the_warm_channel(monkeypatch):
+    completed = {"type": "response.completed", "response": {"usage": {"input_tokens": 40000}}}
+    pool, sockets = _cancelled_pool(monkeypatch, [{"type": "response.output_text.delta", "delta": "a"}, completed])
+    try:
+        assert not sockets[0].closed
+        anchor = next(iter(pool._connections.values())).anchors[-1]
+        assert anchor.drained and anchor.input_tokens == 40000
+        events = list(pool.events({"prompt_cache_key": "one", "input": AFTER_INTERRUPT}, account_id="account",
+                                  access_token="synthetic", timeout=1))
+        assert events[-1]["type"] == "response.completed"
+        assert len(sockets) == 1 and [len(p["input"]) for p in sockets[0].sent] == [1, 3]
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("tail", [[{"type": "response.failed", "response": {"error": {"message": "synthetic"}}}],
+                                  "deadline"])
+def test_unfinished_or_failed_drain_closes_the_channel(monkeypatch, tail):
+    monkeypatch.setattr(siwc_transport, "_DRAIN_SECONDS", .05)
+    pool, sockets = _cancelled_pool(monkeypatch, [] if tail == "deadline" else tail,
+                                    SilentSocket if tail == "deadline" else FakeSocket)
+    try:
+        assert sockets[0].closed
+        assert not next(iter(pool._connections.values())).anchors
+    finally:
+        pool.close()
+
+
+
+def test_drain_request_racing_a_normal_completion_keeps_the_socket(monkeypatch):
+    monkeypatch.setattr(siwc_transport, "_DRAIN_SECONDS", .05)
+    gate, sockets = threading.Event(), []
+
+    class GateSocket(FakeSocket):
+        def recv(self, *, timeout):
+            if len(self.pending) == 1:
+                assert gate.wait(timeout)
+            return super().recv(timeout=timeout)
+
+    def connect(*_args, **_kwargs):
+        sockets.append(GateSocket([{"type": "response.created"}, {"type": "response.completed"}]))
+        return sockets[-1]
+
+    monkeypatch.setattr(siwc_transport, "connect", connect)
+    pool = SIWCWebSocketPool()
+    cancel = provider_module._RequestCancellation()
+    events = pool.events({"prompt_cache_key": "one", "input": LARGE_INPUT}, account_id="account",
+                         access_token="synthetic", timeout=1, cancel=cancel)
+    try:
+        assert next(events)["type"] == "response.created"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(next, events)
+            time.sleep(.02)
+            cancel.cancel()
+            gate.set()
+            assert pending.result(timeout=1)["type"] == "response.completed"
+        time.sleep(.1)  # The drain deadline passes while the generator waits at its final yield.
+        assert not sockets[0].closed
+        assert next(events, None) is None
+        assert not sockets[0].closed and pool.active_requests == 0
     finally:
         events.close()
         pool.close()

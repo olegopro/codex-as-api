@@ -92,6 +92,20 @@ def _connect(access_token: str, timeout: float, cancel: Any) -> tuple[Any, int]:
                 cancel.check()
 
 
+# A client cancel of a large answer keeps its warm channel: the rest of the answer is read and
+# discarded in the background, bounded by this deadline (the remaining output still costs quota).
+_DRAIN_SECONDS = 120.0
+_DRAIN_MIN_BODY_BYTES = 128 * 1024
+
+
+@dataclass
+class _Drain:
+    requested: Any = field(default_factory=threading.Event)
+    lock: Any = field(default_factory=threading.Lock)
+    finished: bool = False
+    timer: Any = None
+
+
 def _branch_key(payload: dict[str, Any]) -> str:
     # Claude Code gives siblings the parent's session ID. The initial user turn
     # and instructions distinguish their histories without retaining prompt text.
@@ -157,6 +171,8 @@ class _Anchor:
     history: tuple[bytes, ...]
     output_key: bytes | None
     input_tokens: int = 0
+    # The client never saw a drained answer, so any continuation of its input matches.
+    drained: bool = False
 
 
 @dataclass
@@ -243,6 +259,8 @@ class SIWCWebSocketPool:
                 elif history[:size] != previous:
                     if observe_mismatch:
                         mismatch_reasons.add("input_mismatch")
+                elif anchor.drained:
+                    scores.append((size + 1, anchor.input_tokens))
                 elif output_key is None:
                     if observe_mismatch:
                         mismatch_reasons.add("missing_key")
@@ -376,7 +394,8 @@ class SIWCWebSocketPool:
         started = time.monotonic()
         first_event_ms = first_delta_ms = None
         completed = False
-        reused = rotated = yielded = False
+        reused = rotated = yielded = drainable = handed_off = False
+        drain = _Drain()
         terminal_reason = "interrupted"
         socket = None
         close_code = close_category = close_source = None
@@ -426,11 +445,27 @@ class SIWCWebSocketPool:
                                     network_attempt=connect_attempts)
                     socket = entry.socket
 
+                    def expire_drain() -> None:
+                        with drain.lock:
+                            # completed is set before the terminal event is yielded, so a finished
+                            # answer whose generator has not resumed yet keeps its warm socket.
+                            if not drain.finished and not completed:
+                                entry.token_hash = ""
+                                socket.close()
+
                     def stop() -> None:
+                        if completed or drain.requested.is_set():
+                            return
+                        if drainable and getattr(socket, "state", State.OPEN) == State.OPEN:
+                            # The client left a large answer: the rest is drained, the channel stays warm.
+                            drain.timer = threading.Timer(_DRAIN_SECONDS, expire_drain)
+                            drain.timer.daemon = True
+                            drain.requested.set()
+                            drain.timer.start()
+                            return
                         # Invalidate before close so a following request cannot reuse a closing channel.
-                        if not completed:
-                            entry.token_hash = ""
-                            socket.close()
+                        entry.token_hash = ""
+                        socket.close()
 
                     with cancel.bind(stop) if cancel is not None else nullcontext():
                         wire = {k: v for k, v in payload.items() if k != "stream"}
@@ -439,9 +474,14 @@ class SIWCWebSocketPool:
                         cache_diagnostics.websocket_request(payload, body, account_id=account_id,
                                                             attempt_id=request_id, channel_id=entry.channel_id)
                         socket.send(body)
+                        drainable = len(body) >= _DRAIN_MIN_BODY_BYTES
                         completed = False
                         try:
                             while True:
+                                if drain.requested.is_set():
+                                    handed_off = self._hand_off(entry, socket, drain, request_id, channel_id,
+                                                                history, session_hash, timeout)
+                                    raise OSError("Upstream request was cancelled by the client")
                                 raw = socket.recv(timeout=timeout)
                                 if diagnostics_enabled():
                                     message_bytes = len(raw) if isinstance(raw, bytes) else len(raw.encode("utf-8"))
@@ -526,8 +566,14 @@ class SIWCWebSocketPool:
                                     return
                                 yielded = True
                                 yield event
+                        except GeneratorExit:
+                            # The SSE consumer closes the stream after the cancel callback.
+                            if drain.requested.is_set() and not completed:
+                                handed_off = self._hand_off(entry, socket, drain, request_id, channel_id,
+                                                            history, session_hash, timeout)
+                            raise
                         finally:
-                            if not completed:
+                            if not completed and not handed_off:
                                 entry.close()
                 except InvalidStatus as exc:
                     close_category = "handshake_error"
@@ -543,7 +589,8 @@ class SIWCWebSocketPool:
                     close_code, close_category, close_source = _close_details(exc, socket)
                     if socket is None:
                         terminal_reason = "connect_failed"
-                    entry.close()
+                    if not handed_off:
+                        entry.close()
                     if (rotated and not yielded and isinstance(exc, ConnectionClosed)
                             and not (cancel is not None and cancel.cancelled)):
                         raise StaleSocketError(str(exc)) from exc
@@ -564,14 +611,76 @@ class SIWCWebSocketPool:
                               "first_event_ms=%s first_delta_ms=%s",
                               request_id, safe_model(key[2]), session_hash, key[3][:12],
                               round((time.monotonic() - started) * 1000), first_event_ms, first_delta_ms)
-            with self._lock:
-                entry.users -= 1
-                entry.last_used = time.monotonic()
-                self._condition.notify_all()
-                diagnostic_emit("channel_released", attempt_id=request_id, channel_id=channel_id,
-                                close_code=close_code, close_category=close_category, close_source=close_source,
-                                max_message_bytes=max_message_bytes,
-                                reason="completed" if completed else terminal_reason)
+            if not handed_off:
+                with drain.lock:
+                    # A completed or failed request must not be closed later by a pending drain deadline.
+                    drain.finished = True
+                    if drain.timer is not None:
+                        drain.timer.cancel()
+                self._release(entry, request_id, channel_id, "completed" if completed else terminal_reason,
+                              close_code=close_code, close_category=close_category, close_source=close_source,
+                              max_message_bytes=max_message_bytes)
+
+    def _release(self, entry: _Connection, request_id: str, channel_id: str, reason: str, **fields: Any) -> None:
+        with self._lock:
+            entry.users -= 1
+            entry.last_used = time.monotonic()
+            self._condition.notify_all()
+            diagnostic_emit("channel_released", attempt_id=request_id, channel_id=channel_id, reason=reason, **fields)
+
+    def _hand_off(self, entry: _Connection, socket: Any, drain: _Drain, request_id: str, channel_id: str,
+                  history: tuple[bytes, ...] | None, session_hash: str, timeout: float) -> bool:
+        if getattr(socket, "state", State.OPEN) != State.OPEN:
+            return False
+        threading.Thread(target=self._drain_cancelled, name="siwc-drain", daemon=True,
+                         args=(entry, socket, drain, request_id, channel_id, history, session_hash, timeout)).start()
+        return True
+
+    def _drain_cancelled(self, entry: _Connection, socket: Any, drain: _Drain, request_id: str, channel_id: str,
+                         history: tuple[bytes, ...] | None, session_hash: str, timeout: float) -> None:
+        # Owns the lease: read the cancelled answer to its end, discard it, keep the warm socket.
+        started = time.monotonic()
+        drained = False
+        counters: tuple[Any, Any, Any] = (None, None, None)
+        try:
+            with entry.lock:
+                while True:
+                    event = strict_json_loads(socket.recv(timeout=timeout))
+                    kind = event.get("type") if isinstance(event, dict) else None
+                    if kind not in _TERMINAL_EVENTS:
+                        continue
+                    drained = kind == "response.completed"
+                    response = event.get("response")
+                    usage = response.get("usage") if isinstance(response, dict) else None
+                    if drained and isinstance(usage, dict):
+                        details = usage.get("input_tokens_details")
+                        counters = (usage.get("input_tokens"),
+                                    details.get("cached_tokens") if isinstance(details, dict) else None,
+                                    usage.get("output_tokens"))
+                    break
+        except Exception:
+            drained = False
+        finally:
+            with drain.lock:
+                drain.finished = True
+                if drain.timer is not None:
+                    drain.timer.cancel()
+            if drained and history is not None:
+                tokens = counters[0]
+                anchor = _Anchor(history, None, tokens if isinstance(tokens, int) and not isinstance(tokens, bool)
+                                 and tokens >= 0 else 0, drained=True)
+                with self._lock:
+                    with suppress(ValueError):
+                        entry.anchors.remove(anchor)
+                    entry.anchors.append(anchor)
+            if not drained:
+                entry.close()
+            diagnostic_emit("upstream_completed" if drained else "upstream_error", attempt_id=request_id,
+                            session_hash=session_hash, drained=True, reason="drained" if drained else "interrupted",
+                            input_tokens=counters[0], cached_tokens=counters[1], output_tokens=counters[2],
+                            elapsed_ms=round((time.monotonic() - started) * 1000))
+            self._release(entry, request_id, channel_id, "drained" if drained else "interrupted",
+                          session_hash=session_hash)
 
     def _retire_locked(self, entries: list[_Connection]) -> None:
         self._retired.extend(entries)
