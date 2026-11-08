@@ -5455,6 +5455,27 @@ def test_anthropic_messages_uses_session_cache_affinity_without_codex_metadata(
     assert "response_id" not in explicit.json()
 
 
+def test_anthropic_agent_headers_do_not_change_wire_request(client, recording_backend: RecordingBackend):
+    payload = {
+        "model": "gpt-5.6-sol",
+        "max_tokens": 1024,
+        "system": "system",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    session = {"x-claude-code-session-id": "claude-session-123"}
+    tagged = {**session, "x-claude-code-agent-id": "a0123456789abcdef",
+              "x-claude-code-parent-agent-id": "afedcba9876543210"}
+    plain_response = client.post("/v1/messages", headers=session, json=payload)
+    tagged_response = client.post("/v1/messages", headers=tagged, json=payload)
+
+    assert plain_response.status_code == tagged_response.status_code == 200
+    plain_outbound = recording_backend.requests.get(timeout=1)
+    tagged_outbound = recording_backend.requests.get(timeout=1)
+    assert plain_outbound["body"] == tagged_outbound["body"]
+    assert "x-claude-code-agent-id" not in plain_outbound["headers"]
+    assert "x-claude-code-agent-id" not in tagged_outbound["headers"]
+
+
 def test_anthropic_messages_without_session_accepts_max_tokens_and_omits_implicit_cache_key(
     client,
     recording_backend: RecordingBackend,

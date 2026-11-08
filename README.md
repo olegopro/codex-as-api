@@ -493,6 +493,14 @@ array indexes (nested content adds indexes). No marker values are logged.
 `fingerprint_version: 1` identifies the unchanged cumulative hash algorithm;
 older records without this field use that same algorithm.
 
+Claude Code subagent identity is recorded next to `session_hash` on every
+stage: `agent_id_hash` is the truncated hash of the `x-claude-code-agent-id`
+header, and `subagent` is true when a valid agent ID differs from the session
+or `x-claude-code-parent-agent-id` is present. Both headers are read for
+diagnostics only and are never forwarded upstream; absent, duplicated or
+malformed values are ignored without changing the request or its status.
+The `subagent` flag is omitted for clients that send neither header.
+
 When returned by the server, `cache_response` also records write-token totals,
 30-minute/12-hour write breakdowns, applied TTL/mode/retention, and allowlisted
 cache-diagnostic type/reason. Missing counters are omitted, not inferred as zero.

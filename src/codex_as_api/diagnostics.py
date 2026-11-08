@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextvars
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -234,7 +235,8 @@ _NUMBERS = {"active_histories", "status", "elapsed_ms", "first_event_ms", "first
             "upstream_bytes", "upstream_lines", "keepalive_lines", "cancel_ms", "close_ms", "token_age_ms",
             "max_read_wait_ms", "max_consumer_gap_ms", "last_keepalive_ms", "close_code", "max_message_bytes",
             "socket_age_ms"}
-_IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel_id", "payload_hash",
+_IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "agent_id_hash", "branch_hash", "channel_id",
+                "payload_hash",
                 "instructions_hash", "tools_hash", "settings_hash", "cache_key_hash", "routing_hash", "wire_hash",
                 "session_header_hash", "thread_header_hash", "client_request_header_hash", "account_hash",
                 "actual_model_hash", "service_tier_hash", "client_instructions_hash", "client_tools_hash",
@@ -244,7 +246,43 @@ _IDENTIFIERS = {"http_id", "attempt_id", "session_hash", "branch_hash", "channel
 _UPSTREAM_IDS = {"upstream_request_id": re.compile(r"(?:req_[A-Za-z0-9_-]{1,160}|[0-9a-f-]{32,36})\Z"),
                  "upstream_response_id": re.compile(r"resp_[A-Za-z0-9_-]{1,160}\Z"),
                  "cf_ray": re.compile(r"[A-Fa-f0-9]{8,32}(?:-[A-Z]{3})?\Z")}
+_CLAUDE_AGENT_HEADER = b"x-claude-code-agent-id"
+_CLAUDE_PARENT_AGENT_HEADER = b"x-claude-code-parent-agent-id"
+_CLAUDE_SESSION_HEADER = b"x-claude-code-session-id"
+_CLAUDE_AGENT_NAMESPACE = "codex-as-api:claude-code-agent:"
+_CLAUDE_AGENT_ID = re.compile(r"a[0-9a-f]{16}\Z")
 _PROCESS_ID = uuid.uuid4().hex
+
+
+def _single_header(headers: Any, name: bytes) -> str | None:
+    if not isinstance(headers, (list, tuple)):
+        return None
+    values = [item[1] for item in headers
+              if isinstance(item, (list, tuple)) and len(item) == 2
+              and isinstance(item[0], bytes) and item[0].lower() == name]
+    if len(values) != 1 or not isinstance(values[0], (bytes, bytearray)):
+        return None
+    try:
+        value = bytes(values[0]).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return value if 0 < len(value) <= 200 else None
+
+
+def claude_agent_fields(headers: Any) -> dict[str, Any]:
+    """Claude Code subagent identity for diagnostics only; never forwarded upstream."""
+    agent = _single_header(headers, _CLAUDE_AGENT_HEADER)
+    parent = _single_header(headers, _CLAUDE_PARENT_AGENT_HEADER)
+    session = _single_header(headers, _CLAUDE_SESSION_HEADER)
+    agent = agent if agent is not None and _CLAUDE_AGENT_ID.fullmatch(agent) else None
+    parent = parent if parent is not None and _CLAUDE_AGENT_ID.fullmatch(parent) else None
+    if agent is None and parent is None and session is None:
+        return {}
+    fields: dict[str, Any] = {"subagent": (agent is not None and agent != session) or parent is not None}
+    if agent is not None:
+        fields["agent_id_hash"] = hashlib.sha256(
+            f"{_CLAUDE_AGENT_NAMESPACE}{agent}".encode()).hexdigest()[:12]
+    return fields
 
 
 def _new_process_id() -> None:
@@ -266,6 +304,8 @@ def emit(stage: str, **fields: Any) -> None:
         fields.setdefault("http_id", context["http_id"])
         fields.setdefault("route", context.get("route"))
         fields.setdefault("session_hash", context.get("session_hash"))
+        fields.setdefault("agent_id_hash", context.get("agent_id_hash"))
+        fields.setdefault("subagent", context.get("subagent"))
     record: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat(), "stage": stage,
                               "process_id": _PROCESS_ID}
     for key, value in fields.items():
@@ -276,7 +316,7 @@ def emit(stage: str, **fields: Any) -> None:
                 and all(char in "0123456789abcdef" for char in value))
             or (key in {"would_echo", "reused", "stream", "usage_available", "cache_write_usage_available",
                         "turn_state_present", "routing_hint_present", "socket_shutdown", "new_turn", "mixed_user_tool",
-                        "new_turn_v2", "rule_disagreement", "token_rotated", "drained"}
+                        "new_turn_v2", "rule_disagreement", "token_rotated", "drained", "subagent"}
                 and isinstance(value, bool))
             or (key in _UPSTREAM_IDS and isinstance(value, str) and _UPSTREAM_IDS[key].fullmatch(value))
             or (key in {"input_prefix_hashes", "client_prefix_hashes"} and isinstance(value, list)
@@ -316,7 +356,8 @@ class LifecycleMiddleware:
             await self.app(scope, receive, send)
             return
         state: dict[str, Any] = {"http_id": uuid.uuid4().hex, "started": time.monotonic(),
-                                 "failed": False, "route": scope.get("path")}
+                                 "failed": False, "route": scope.get("path"),
+                                 **claude_agent_fields(scope.get("headers") or [])}
         token = _context.set(state)
         emit("http_start")
 

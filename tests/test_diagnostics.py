@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -831,3 +832,65 @@ def test_cache_control_position_allowlist_rejects_strings_and_malformed_paths(di
         diagnostics.emit("client_cache_request", client_cache_control_positions=positions)
     assert all("client_cache_control_positions" not in r for r in records(diagnostic_log))
     assert "canary" not in diagnostic_log.read_text()
+
+
+async def _ok_app(scope, receive, send):
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"ok"})
+
+
+def test_claude_agent_identity_is_hashed_and_stable(diagnostic_log):
+    agent = "a0123456789abcdef"
+    headers = {"x-claude-code-session-id": "session-1", "x-claude-code-agent-id": agent,
+               "x-claude-code-parent-agent-id": "afedcba9876543210"}
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers=headers)
+    client.get("/v1/messages", headers=headers)
+    starts = [r for r in records(diagnostic_log) if r["stage"] == "http_start"]
+    expected = hashlib.sha256(f"codex-as-api:claude-code-agent:{agent}".encode()).hexdigest()[:12]
+    assert len(starts) == 2
+    assert all(r["agent_id_hash"] == expected and r["subagent"] is True for r in starts)
+    assert agent not in diagnostic_log.read_text()
+
+
+def test_claude_session_without_agent_is_not_a_subagent(diagnostic_log):
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers={"x-claude-code-session-id": "session-1"})
+    start = [r for r in records(diagnostic_log) if r["stage"] == "http_start"][0]
+    assert start["subagent"] is False and "agent_id_hash" not in start
+
+
+def test_claude_parent_without_agent_marks_subagent(diagnostic_log):
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers={"x-claude-code-session-id": "session-1",
+                                        "x-claude-code-parent-agent-id": "afedcba9876543210"})
+    start = [r for r in records(diagnostic_log) if r["stage"] == "http_start"][0]
+    assert start["subagent"] is True and "agent_id_hash" not in start
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    {"x-claude-code-agent-id": "not-an-agent"},
+    {"x-claude-code-parent-agent-id": "not-a-parent"},
+])
+def test_claude_agent_identity_missing_or_invalid_is_omitted(diagnostic_log, headers):
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers=headers)
+    start = [r for r in records(diagnostic_log) if r["stage"] == "http_start"][0]
+    assert "agent_id_hash" not in start and "subagent" not in start
+
+
+def test_claude_invalid_parent_does_not_discard_valid_agent(diagnostic_log):
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers={"x-claude-code-agent-id": "a0123456789abcdef",
+                                        "x-claude-code-parent-agent-id": "bad"})
+    start = [r for r in records(diagnostic_log) if r["stage"] == "http_start"][0]
+    assert start["agent_id_hash"] and start["subagent"] is True
+
+
+def test_claude_duplicate_agent_header_is_ignored(diagnostic_log):
+    client = TestClient(diagnostics.LifecycleMiddleware(_ok_app), raise_server_exceptions=False)
+    client.get("/v1/messages", headers=[("x-claude-code-agent-id", "a0123456789abcdef"),
+                                        ("x-claude-code-agent-id", "afedcba9876543210")])
+    start = [r for r in records(diagnostic_log) if r["stage"] == "http_start"][0]
+    assert "agent_id_hash" not in start and "subagent" not in start
