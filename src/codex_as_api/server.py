@@ -111,9 +111,12 @@ CODEX_CONFIG = load_codex_config() if BACKEND == "codex" else CodexConfig(codex_
 MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model)
 AUTH_PATH = _env_str("CODEX_AS_API_SIWC_AUTH_PATH" if BACKEND == "siwc" else "CODEX_AS_API_AUTH_PATH", None)
 CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
+CLAUDE_CODE_AGENT_HEADER = "x-claude-code-agent-id"
 ANTHROPIC_HEARTBEAT_SECONDS = 10.0
 SIWC_THREADPOOL_HEADROOM = 8
 _CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
+_CLAUDE_AGENT_THREAD_NAMESPACE = "codex-as-api:claude-code-agent-thread:"
+_CLAUDE_CODE_AGENT_ID = re.compile(r"a[0-9a-f]{16}\Z")
 _ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
 _ANTHROPIC_MESSAGES_FIELDS = frozenset(
     {
@@ -594,6 +597,16 @@ def _anthropic_prompt_cache_key(body: dict[str, Any], claude_session_id: str | N
     if claude_session_id is None:
         return None
     value = f"{_CLAUDE_CACHE_KEY_NAMESPACE}{claude_session_id}".encode()
+    return hashlib.sha256(value).hexdigest()
+
+
+def _anthropic_agent_thread_id(headers: Headers, prompt_cache_key: str | None) -> str | None:
+    # Claude Code sends one session id for the main thread and every subagent. A subagent gets
+    # its own Legacy thread, like a Codex spawned thread; the session and cache key stay shared.
+    values = headers.getlist(CLAUDE_CODE_AGENT_HEADER)
+    if prompt_cache_key is None or len(values) != 1 or not _CLAUDE_CODE_AGENT_ID.fullmatch(values[0]):
+        return None
+    value = f"{_CLAUDE_AGENT_THREAD_NAMESPACE}{prompt_cache_key}:{values[0]}".encode()
     return hashlib.sha256(value).hexdigest()
 
 
@@ -2709,6 +2722,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         )
         if prompt_cache_key and (context := diagnostic_context()) is not None:
             context["session_hash"] = hashlib.sha256(prompt_cache_key.encode()).hexdigest()[:12]
+        agent_thread_id = _anthropic_agent_thread_id(http_request.headers, prompt_cache_key)
         _validate_anthropic_context_management(body.get("context_management"))
         raw_thinking = body.get("thinking")
         raw_messages = body.get("messages")
@@ -2886,6 +2900,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                         stop=stop,
                         prompt_cache_key=prompt_cache_key,
                         subagent=subagent,
+                        agent_thread_id=agent_thread_id,
                         memgen_request=memgen_request,
                         text=text,
                         codex_metadata=False,
@@ -2942,6 +2957,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                 stop=stop,
                 prompt_cache_key=prompt_cache_key,
                 subagent=subagent,
+                agent_thread_id=agent_thread_id,
                 memgen_request=memgen_request,
                 text=text,
                 codex_metadata=False,

@@ -712,11 +712,15 @@ class ChatGPTOAuthProvider:
         version_resolver: CodexVersionResolver | CodexVersionProvider | None = None,
         siwc_transport: str | None = None,
         legacy_routing: str | None = None,
+        subagent_identity: str | None = None,
     ) -> None:
         self.backend = resolve_backend(backend)
         self.legacy_routing = legacy_routing or os.getenv("CODEX_AS_API_LEGACY_ROUTING", "observe")
         if self.legacy_routing not in {"observe", "shadow", "turn-state", "native"}:
             raise ValueError("Legacy routing must be observe, shadow, turn-state or native")
+        self.subagent_identity = subagent_identity or os.getenv("CODEX_AS_API_SUBAGENT_IDENTITY", "off")
+        if self.subagent_identity not in {"off", "thread"}:
+            raise ValueError("Subagent identity must be off or thread")
         self._legacy_routing: Any = None
         if self.backend == "codex" and self.legacy_routing != "observe":
             from .legacy_routing import LegacyRouting
@@ -1073,6 +1077,7 @@ class ChatGPTOAuthProvider:
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
         subagent: str | None = None,
+        agent_thread_id: str | None = None,
         memgen_request: bool | None = None,
         previous_response_id: str | None = None,
         service_tier: str | None = None,
@@ -1111,6 +1116,7 @@ class ChatGPTOAuthProvider:
             stop=stop,
             prompt_cache_key=prompt_cache_key,
             subagent=subagent,
+            agent_thread_id=agent_thread_id,
             memgen_request=memgen_request,
             previous_response_id=previous_response_id,
             service_tier=service_tier,
@@ -1201,6 +1207,7 @@ class ChatGPTOAuthProvider:
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
         subagent: str | None = None,
+        agent_thread_id: str | None = None,
         memgen_request: bool | None = None,
         previous_response_id: str | None = None,
         service_tier: str | None = None,
@@ -1251,6 +1258,10 @@ class ChatGPTOAuthProvider:
         extra_headers.cancel = prepared.cancel
         if subagent is not None:
             extra_headers["x-openai-subagent"] = _validate_header_token(subagent, "subagent")
+        if agent_thread_id is not None and self.backend == "codex" and self.subagent_identity == "thread":
+            # Like Codex spawned threads: session-id and prompt_cache_key stay shared, the thread is own.
+            thread = _validate_header_token(agent_thread_id, "agent_thread_id")
+            extra_headers["thread-id"] = extra_headers["x-client-request-id"] = thread
         if memgen_request is not None:
             extra_headers["x-openai-memgen-request"] = "true" if memgen_request else "false"
         stream = self._post_sse(

@@ -557,6 +557,15 @@ running gateway.
 The event deadline observes consumer-processed events: downstream backpressure
 lasting longer than the timeout can also close the upstream stream.
 
+`CODEX_AS_API_SUBAGENT_IDENTITY=off` is the default: one Legacy thread per Claude
+Code session. `thread` gives each Claude Code subagent (a valid
+`x-claude-code-agent-id`) its own `thread-id` and `x-client-request-id`, derived from
+the session cache key and the agent ID, like Codex spawned threads. `session-id`,
+`prompt_cache_key` and the request body stay shared; the main thread is unchanged.
+Legacy HTTP only: SIWC ignores the setting, and `native` routing still sends its
+history lane. It targets cache misses of subagents resumed after idle while
+same-type siblings share the session; local tests do not prove a cache improvement.
+
 Prompt text, tool arguments, encrypted reasoning, credentials, and raw account
 or session identifiers are not logged. Local files have mode `0600`, rotate
 at 5 MiB, and retain up to seven days within a 256 MiB total cap. A capacity

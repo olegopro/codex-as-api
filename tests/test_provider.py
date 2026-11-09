@@ -4792,3 +4792,43 @@ def test_responses_requests_carry_codex_session_headers_only_with_a_key(monkeypa
         assert headers["x-client-request-id"] == "cache-key-7"
     assert "session-id" not in seen[2][1]
     assert "thread-id" not in seen[2][1]
+
+
+def test_subagent_identity_defaults_to_off_and_rejects_unknown_modes(monkeypatch):
+    monkeypatch.delenv("CODEX_AS_API_SUBAGENT_IDENTITY", raising=False)
+    assert ChatGPTOAuthProvider().subagent_identity == "off"
+    with pytest.raises(ValueError, match="Subagent identity must be off or thread"):
+        ChatGPTOAuthProvider(subagent_identity="session")
+    monkeypatch.setenv("CODEX_AS_API_SUBAGENT_IDENTITY", "key")
+    with pytest.raises(ValueError, match="Subagent identity must be off or thread"):
+        ChatGPTOAuthProvider()
+    monkeypatch.setenv("CODEX_AS_API_SUBAGENT_IDENTITY", "thread")
+    assert ChatGPTOAuthProvider().subagent_identity == "thread"
+
+
+@pytest.mark.parametrize(
+    ("backend", "identity", "expected"),
+    [
+        ("codex", "off", {}),
+        ("codex", "thread", {"thread-id": "agent-thread", "x-client-request-id": "agent-thread"}),
+        ("siwc", "thread", {}),
+    ],
+)
+def test_agent_thread_headers_apply_only_to_legacy_thread_identity(monkeypatch, backend, identity, expected):
+    class HeadersSentError(Exception):
+        pass
+
+    provider = ChatGPTOAuthProvider(backend=backend, subagent_identity=identity)
+    seen: list[dict[str, str]] = []
+
+    def post_sse(_path, _payload, extra_headers=None):
+        seen.append(dict(extra_headers or {}))
+        raise HeadersSentError
+
+    monkeypatch.setattr(provider, "_post_sse", post_sse)
+    prepared = SimpleNamespace(payload={"model": "gpt-6-luna"}, replay_input=(),
+                               snapshot=SimpleNamespace(key=None), cancel=None)
+    with pytest.raises(HeadersSentError):
+        list(provider.chat_stream([], agent_thread_id="agent-thread", _prepared_request=prepared))
+    routing = {name: value for name, value in seen[0].items() if name in {"thread-id", "x-client-request-id"}}
+    assert routing == expected

@@ -5474,6 +5474,49 @@ def test_anthropic_agent_headers_do_not_change_wire_request(client, recording_ba
     assert plain_outbound["body"] == tagged_outbound["body"]
     assert "x-claude-code-agent-id" not in plain_outbound["headers"]
     assert "x-claude-code-agent-id" not in tagged_outbound["headers"]
+    routing = ("session-id", "thread-id", "x-client-request-id")
+    assert {name: tagged_outbound["headers"][name] for name in routing} == {
+        name: plain_outbound["headers"][name] for name in routing
+    }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_subagent_identity_thread_gives_each_agent_its_own_thread(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+    stream,
+):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod._provider, "subagent_identity", "thread")
+    payload = {
+        "model": "gpt-5.6-sol",
+        "max_tokens": 1024,
+        "stream": stream,
+        "system": "system",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    session = {"x-claude-code-session-id": "claude-session-123"}
+    first_agent = {**session, "x-claude-code-agent-id": "a0123456789abcdef"}
+    second_agent = {**session, "x-claude-code-agent-id": "afedcba9876543210"}
+    malformed = {**session, "x-claude-code-agent-id": "not-an-agent"}
+    for headers in (session, first_agent, first_agent, second_agent, malformed):
+        assert client.post("/v1/messages", headers=headers, json=payload).status_code == 200
+    main, first, repeated, second, unknown = (recording_backend.requests.get(timeout=1) for _ in range(5))
+
+    key = hashlib.sha256(b"codex-as-api:claude-code-session:claude-session-123").hexdigest()
+    thread = hashlib.sha256(f"codex-as-api:claude-code-agent-thread:{key}:a0123456789abcdef".encode()).hexdigest()
+    assert main["headers"]["session-id"] == main["headers"]["thread-id"] == key
+    assert main["headers"]["x-client-request-id"] == key
+    assert first["headers"]["session-id"] == key
+    assert first["headers"]["thread-id"] == first["headers"]["x-client-request-id"] == thread
+    assert repeated["headers"]["thread-id"] == thread
+    assert second["headers"]["session-id"] == key
+    assert second["headers"]["thread-id"] not in {key, thread}
+    assert unknown["headers"]["thread-id"] == key
+    assert main["body"] == first["body"] == second["body"] == unknown["body"]
+    assert main["body"]["prompt_cache_key"] == key
 
 
 def test_anthropic_messages_without_session_accepts_max_tokens_and_omits_implicit_cache_key(
