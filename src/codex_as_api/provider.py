@@ -87,6 +87,12 @@ from .strict_json import strict_json_loads
 
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 SIWC_BASE_URL = "https://api.openai.com/v1"
+API_BASE_URL = "https://api.openai.com/v1"
+API_KEY_ENV = "OPENAI_API_KEY"
+PROMPT_CACHE_TTL_ENV = "CODEX_AS_API_PROMPT_CACHE_TTL"
+MAX_OUTPUT_TOKENS_ENV = "CODEX_AS_API_MAX_OUTPUT_TOKENS"
+DEFAULT_API_MAX_OUTPUT_TOKENS = 128000
+_PUBLIC_BACKENDS = frozenset({"siwc", "api"})
 BACKEND_ENV = "CODEX_AS_API_BACKEND"
 SIWC_TOOL_NAMESPACE = "codex_as_api"
 _SIWC_PAYLOAD_FIELDS = frozenset({
@@ -637,9 +643,39 @@ def codex_session_headers(payload: dict[str, Any]) -> dict[str, str]:
 
 def resolve_backend(value: str | None = None) -> str:
     backend = os.getenv(BACKEND_ENV, "codex") if value is None else value
-    if backend not in {"codex", "siwc"}:
-        raise ValueError(f"{BACKEND_ENV}: допускаются только codex и siwc")
+    if backend not in {"codex", "siwc", "api"}:
+        raise ValueError(f"{BACKEND_ENV}: допускаются только codex, siwc и api")
     return backend
+
+
+@dataclass(frozen=True)
+class _ApiKeyToken:
+    """Public API key in the shape of an OAuth token; account_id is a non-secret fingerprint."""
+
+    access_token: str
+    account_id: str
+    refresh_token: None = None
+    id_token: None = None
+    fedramp: bool = False
+    oauth_profile: str = "api"
+
+
+def _api_key_token() -> _ApiKeyToken:
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    if not key or any(ch in key for ch in ("\r", "\n", " ")):
+        raise ChatGPTOAuthMissingError(f"{API_KEY_ENV} не задан для backend api")
+    return _ApiKeyToken(access_token=key, account_id="api-key-" + hashlib.sha256(key.encode()).hexdigest()[:16])
+
+
+def _api_output_limit(value: int | str | None) -> int:
+    raw = os.getenv(MAX_OUTPUT_TOKENS_ENV, str(DEFAULT_API_MAX_OUTPUT_TOKENS)) if value is None else value
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{MAX_OUTPUT_TOKENS_ENV}: ожидается целое число") from None
+    if limit != 0 and limit < 16:
+        raise ValueError(f"{MAX_OUTPUT_TOKENS_ENV}: 0 (не передавать) или не меньше 16")
+    return limit
 
 
 class _HTTPXResponse:
@@ -713,8 +749,15 @@ class ChatGPTOAuthProvider:
         siwc_transport: str | None = None,
         legacy_routing: str | None = None,
         subagent_identity: str | None = None,
+        prompt_cache_ttl: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         self.backend = resolve_backend(backend)
+        # Public API only: implicit cache with a minimum lifetime and the model output ceiling.
+        self.prompt_cache_ttl = prompt_cache_ttl or os.getenv(PROMPT_CACHE_TTL_ENV, "12h")
+        if self.prompt_cache_ttl not in {"off", "30m", "12h"}:
+            raise ValueError(f"{PROMPT_CACHE_TTL_ENV}: допускаются off, 30m или 12h")
+        self.max_output_tokens = _api_output_limit(max_output_tokens)
         self.legacy_routing = legacy_routing or os.getenv("CODEX_AS_API_LEGACY_ROUTING", "observe")
         if self.legacy_routing not in {"observe", "shadow", "turn-state", "native"}:
             raise ValueError("Legacy routing must be observe, shadow, turn-state or native")
@@ -751,6 +794,8 @@ class ChatGPTOAuthProvider:
             if base_url is not None and base_url != SIWC_BASE_URL:
                 raise ValueError("SIWC допускает только https://api.openai.com/v1")
             self.base_url = SIWC_BASE_URL
+        elif self.backend == "api":
+            self.base_url = _normalize_base_url(API_BASE_URL if base_url is None else base_url)
         else:
             self.base_url = _normalize_base_url(CHATGPT_OAUTH_DEFAULT_BASE_URL if base_url is None else base_url)
         self._http_client = http_client
@@ -759,7 +804,8 @@ class ChatGPTOAuthProvider:
             from .siwc_auth import resolve_auth_path as resolve_siwc_auth_path
             self.auth_json_path = os.fspath(resolve_siwc_auth_path(auth_json_path))
         else:
-            self.auth_json_path = auth_json_path
+            # The api backend has no credentials file: the key is read from the environment per request.
+            self.auth_json_path = None if self.backend == "api" else auth_json_path
         self.timeout = (
             CHATGPT_OAUTH_DEFAULT_TIMEOUT if timeout is None else _validate_positive_finite(timeout, "timeout")
         )
@@ -783,8 +829,8 @@ class ChatGPTOAuthProvider:
         self._response_chains = _ResponseChainStore()
 
     def _resolve_client_version(self) -> str:
-        if self.backend == "siwc":
-            return "siwc"
+        if self.backend in _PUBLIC_BACKENDS:
+            return self.backend
         return resolve_codex_cli_version(self._version_resolver)
 
     def _require_token_profile(self, token: Any) -> None:
@@ -792,6 +838,8 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthMissingError("Профиль OAuth не соответствует выбранному backend")
 
     def _token_for_request(self) -> Any:
+        if self.backend == "api":
+            return _api_key_token()
         token = (
             token_for_request(self.auth_json_path, expected_profile="siwc")
             if self.backend == "siwc"
@@ -802,6 +850,9 @@ class ChatGPTOAuthProvider:
 
     def _refresh_after_unauthorized(self, token: Any) -> Any:
         self._require_token_profile(token)
+        if self.backend == "api":
+            # An API key has no refresh: a 401 is final and is not retried.
+            raise ChatGPTOAuthUpstreamError(401, "OpenAI API отклонил ключ OPENAI_API_KEY (HTTP 401)")
         refreshed = (
             refresh_after_unauthorized(token, expected_profile="siwc")
             if self.backend == "siwc"
@@ -1256,13 +1307,14 @@ class ChatGPTOAuthProvider:
             catalog_key=prepared.snapshot.key,
         )
         extra_headers.cancel = prepared.cancel
-        if subagent is not None:
+        # x-openai-subagent and x-openai-memgen-request are private Codex headers.
+        if subagent is not None and self.backend != "api":
             extra_headers["x-openai-subagent"] = _validate_header_token(subagent, "subagent")
         if agent_thread_id is not None and self.backend == "codex" and self.subagent_identity == "thread":
             # Like Codex spawned threads: session-id and prompt_cache_key stay shared, the thread is own.
             thread = _validate_header_token(agent_thread_id, "agent_thread_id")
             extra_headers["thread-id"] = extra_headers["x-client-request-id"] = thread
-        if memgen_request is not None:
+        if memgen_request is not None and self.backend != "api":
             extra_headers["x-openai-memgen-request"] = "true" if memgen_request else "false"
         stream = self._post_sse(
             "/responses",
@@ -1621,9 +1673,9 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> str:
-        if self.backend == "siwc":
+        if self.backend in _PUBLIC_BACKENDS:
             if responses_lite is not None and resolve_responses_lite_mode(responses_lite) == "on":
-                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным SIWC")
+                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным Responses API")
             responses_lite = False
         if not isinstance(prompt, str) or prompt.strip() == "":
             raise ChatGPTOAuthInvalidRequestError("image inspection prompt is required")
@@ -1714,8 +1766,9 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> str:
-        if self.backend == "siwc":
-            raise ChatGPTOAuthInvalidRequestError("/responses/compact не подтверждён для SIWC OAuth и отключён")
+        if self.backend in _PUBLIC_BACKENDS:
+            raise ChatGPTOAuthInvalidRequestError(
+                "/responses/compact — приватный эндпоинт Codex; публичный backend его не использует")
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
         base_instructions, input_items = _split_instructions_and_input(
@@ -1864,17 +1917,18 @@ class ChatGPTOAuthProvider:
         verbosity: str | None = None,
         _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
     ) -> PreparedChatRequest:
-        if self.backend == "siwc":
+        if self.backend in _PUBLIC_BACKENDS:
             if codex_metadata is True:
-                raise ChatGPTOAuthInvalidRequestError("Codex metadata не поддерживается публичным SIWC")
+                raise ChatGPTOAuthInvalidRequestError("Codex metadata не поддерживается публичным Responses API")
             if responses_lite is not None and resolve_responses_lite_mode(responses_lite) == "on":
-                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным SIWC")
+                raise ChatGPTOAuthInvalidRequestError("Responses Lite не поддерживается публичным Responses API")
             responses_lite = False
             codex_metadata = False
             client_metadata = None
         if temperature is not None:
             raise ChatGPTOAuthInvalidRequestError("temperature is not supported by the ChatGPT Codex OAuth transport")
-        if max_tokens is not None:
+        # On the api backend the model output ceiling replaces a client max_tokens (see below).
+        if max_tokens is not None and self.backend != "api":
             raise ChatGPTOAuthInvalidRequestError("max_tokens is not supported by the ChatGPT Codex OAuth transport")
         _reject_unsupported_stop(stop)
         instructions, input_items = _split_instructions_and_input(
@@ -1954,7 +2008,14 @@ class ChatGPTOAuthProvider:
             responses_lite=responses_lite,
             safety_identifier=safety_identifier,
             prompt_cache_options=prompt_cache_options,
+            forward_prompt_cache_options=self.backend == "api",
         )
+        if self.backend == "api":
+            if "prompt_cache_options" not in payload and self.prompt_cache_ttl != "off":
+                payload["prompt_cache_options"] = {"mode": "implicit", "ttl": self.prompt_cache_ttl}
+            if self.max_output_tokens:
+                # An upper bound against truncation, not a target: the model stops on its own.
+                payload["max_output_tokens"] = self.max_output_tokens
         tool_names = _prepare_siwc_tools(payload) if self.backend == "siwc" else {}
         if self.backend == "siwc":
             _validate_siwc_wire_payload(payload)
@@ -1974,7 +2035,8 @@ class ChatGPTOAuthProvider:
     ) -> dict[str, str]:
         token = token or self._token_for_request()
         self._require_token_profile(token)
-        if self.backend == "siwc":
+        if self.backend in _PUBLIC_BACKENDS:
+            # Public Responses API: bearer credentials only, no ChatGPT account, originator or CLI headers.
             return {"Authorization": f"Bearer {token.access_token}", "Content-Type": "application/json"}
         resolved_version = self._resolve_client_version() if client_version is None else client_version
         headers = {
@@ -2111,6 +2173,11 @@ class ChatGPTOAuthProvider:
                                 if tier is not None else f"model={model}")
                         if lease is not None and self.legacy_routing in {"native", "turn-state"}:
                             headers.update(lease.headers(threads=self.legacy_routing == "native"))
+                elif self.backend == "api":
+                    # Public API over HTTP SSE: no Codex session, thread, routing or turn-state headers.
+                    headers["Accept"] = "text/event-stream"
+                    if extra_headers:
+                        headers.update(extra_headers)
                 else:
                     _validate_siwc_wire_payload(payload)
                 req = urllib.request.Request(
@@ -2151,7 +2218,7 @@ class ChatGPTOAuthProvider:
                         self._active_responses.add(response)
                     block: list[str] = []
                     reader = (_LegacySSEReader(response, self.timeout, started=wire_started)
-                              if self.backend == "codex" else response)
+                              if self.backend in {"codex", "api"} else response)
                     try:
                         while True:
                             raw_line = reader.readline()
@@ -2164,7 +2231,8 @@ class ChatGPTOAuthProvider:
                                 if eof_kind != "completed":
                                     eof_kind = "clean_eof"
                                 if block:
-                                    event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
+                                    event = _decode_sse_block(
+                                        block, reject_error_lines=self.backend in _PUBLIC_BACKENDS)
                                     if event is not None:
                                         if lease is not None:
                                             self._legacy_routing_call("observe", lease.observe, event,
@@ -2186,13 +2254,13 @@ class ChatGPTOAuthProvider:
                                     "ChatGPT OAuth SSE response was not valid UTF-8"
                                 ) from exc
                             if line == "":
-                                event = _decode_sse_block(block, reject_error_lines=self.backend == "siwc")
+                                event = _decode_sse_block(block, reject_error_lines=self.backend in _PUBLIC_BACKENDS)
                                 block = []
                                 if event is not None:
                                     if lease is not None:
                                         self._legacy_routing_call("observe", lease.observe, event,
                                                                      echoed="x-codex-turn-state" in headers)
-                                    if self.backend == "codex":
+                                    if self.backend in {"codex", "api"}:
                                         reader.event_received()
                                     if event.get("type") == "response.completed":
                                         eof_kind = "completed"
@@ -2206,7 +2274,7 @@ class ChatGPTOAuthProvider:
                                 continue
                             block.append(line)
                     finally:
-                        if self.backend == "codex":
+                        if self.backend in {"codex", "api"}:
                             reader.close()
                         close_started = time.monotonic()
                         with self._active_response_lock:
@@ -2262,8 +2330,9 @@ class ChatGPTOAuthProvider:
         extra_headers: dict[str, str] | None = None,
         catalog_key: CatalogKey | None = None,
     ) -> bytes:
-        if self.backend == "siwc":
-            raise ChatGPTOAuthInvalidRequestError("Нестримовый upstream и /responses/compact не поддерживаются SIWC")
+        if self.backend in _PUBLIC_BACKENDS:
+            raise ChatGPTOAuthInvalidRequestError(
+                "Нестримовый upstream и /responses/compact не поддерживаются публичным backend")
         token_values: tuple[str | None, ...] = (None,)
         resolved_client_version = (
             catalog_key[2] if catalog_key is not None else self._resolve_client_version()
@@ -2504,6 +2573,22 @@ def _reject_safety_identifier(_value: object) -> None:
 
 def _reject_prompt_cache_options(_value: object) -> None:
     raise ChatGPTOAuthInvalidRequestError("prompt_cache_options is not supported by the ChatGPT Codex OAuth transport")
+
+
+def _validate_prompt_cache_options(value: object) -> dict[str, Any]:
+    """Public CreateResponse shape: mode implicit|explicit, ttl 30m|12h, boolean prewarm."""
+    if not isinstance(value, dict):
+        raise ChatGPTOAuthInvalidRequestError("prompt_cache_options must be an object")
+    unknown = sorted(set(value) - {"mode", "ttl", "prewarm"})
+    if unknown:
+        raise ChatGPTOAuthInvalidRequestError("prompt_cache_options contains unsupported fields: " + ", ".join(unknown))
+    if "mode" in value and value["mode"] not in {"implicit", "explicit"}:
+        raise ChatGPTOAuthInvalidRequestError("prompt_cache_options.mode must be implicit or explicit")
+    if "ttl" in value and value["ttl"] not in {"30m", "12h"}:
+        raise ChatGPTOAuthInvalidRequestError("prompt_cache_options.ttl must be 30m or 12h")
+    if "prewarm" in value and not isinstance(value["prewarm"], bool):
+        raise ChatGPTOAuthInvalidRequestError("prompt_cache_options.prewarm must be a boolean")
+    return dict(value)
 
 
 def _merge_text_and_verbosity(
@@ -3142,6 +3227,7 @@ def _finalize_responses_payload(
     include_encrypted_content: bool = True,
     safety_identifier: str | None = None,
     prompt_cache_options: dict[str, Any] | None = None,
+    forward_prompt_cache_options: bool = False,
 ) -> None:
     _require_input_modalities(capability, payload)
     if not capability.supports_image_detail_original and _has_original_image_detail(payload):
@@ -3149,7 +3235,9 @@ def _finalize_responses_payload(
     if safety_identifier is not None:
         _reject_safety_identifier(safety_identifier)
     if prompt_cache_options is not None:
-        _reject_prompt_cache_options(prompt_cache_options)
+        if not forward_prompt_cache_options:
+            _reject_prompt_cache_options(prompt_cache_options)
+        payload["prompt_cache_options"] = _validate_prompt_cache_options(prompt_cache_options)
     merged_text = _merge_text_and_verbosity(text, verbosity)
     try:
         apply_model_capability_fields(

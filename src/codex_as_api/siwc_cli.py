@@ -1,4 +1,4 @@
-"""Локальные login/status/preflight обоих OAuth-профилей без сервера инференса."""
+"""Локальные login/status/preflight профилей siwc, codex и api без сервера инференса."""
 from __future__ import annotations
 
 import argparse
@@ -77,7 +77,12 @@ def main(argv: Sequence[str] | None = None, *, backend: str = "siwc") -> int:
     login.add_argument("--open-browser", action="store_true", help="Явно разрешить открытие страницы входа")
     args = parser.parse_args(argv)
     if args.command == "status":
-        if backend == "siwc":
+        status_result: dict[str, object]
+        if backend == "api":
+            # Only the presence of the key is reported, never its value.
+            present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+            status_result = {"auth_profile": "api", "state": "key_present" if present else "key_missing"}
+        elif backend == "siwc":
             status_result = siwc_auth.read_status(args.auth_path)
         else:
             try:
@@ -90,6 +95,9 @@ def main(argv: Sequence[str] | None = None, *, backend: str = "siwc") -> int:
         return 0
     if args.command == "preflight":
         return _preflight(args.auth_path) if backend == "siwc" else _preflight(args.auth_path, backend=backend)
+    if backend == "api":
+        print("Профиль api не использует вход OAuth: ключ берётся из OPENAI_API_KEY окружения.", file=sys.stderr)
+        return 2
     try:
         return asyncio.run(_login(args.auth_path, open_browser=args.open_browser, backend=backend))
     except KeyboardInterrupt:

@@ -8,12 +8,13 @@
 политик OpenAI и реально выданного каталога. Публичная API-карточка движка не
 доказывает такое же окно или набор инструментов на подписочном маршруте.
 
-## Два явно разделённых профиля
+## Три явно разделённых профиля
 
 | Профиль | Авторизация | Upstream |
 |---|---|---|
 | `codex` — по умолчанию | существующий standalone Codex OAuth upstream | ChatGPT Codex backend |
 | `siwc` — явно | собственная регистрация и direct ChatGPT-plan grant | `https://api.openai.com/v1` |
+| `api` — явно | `Authorization: Bearer $OPENAI_API_KEY`, оплата по токенам API | `https://api.openai.com/v1/responses` |
 
 Оба профиля используют одну актуальную Python-сборку: переводчик, инструменты,
 внешний WebSearch и диагностика общие. Старый пакет 0.9.6 для `codex` не требуется.
@@ -43,6 +44,29 @@ export CODEX_AS_API_AUTH_PATH="$HOME/.codex-as-api/legacy/auth.json"
 Профиль `siwc` **не использует API key или API-кредиты** и не переходит на них
 при ошибке. Credentials другого OAuth-клиента не импортируются. TypeScript и Rust
 в этой ветке не получают SIWC-поддержку автоматически: адаптация относится к Python.
+
+## Профиль `api` — публичный Responses API по ключу
+
+`CODEX_AS_API_BACKEND=api` отправляет тот же перевод, что Legacy, в публичный
+`POST https://api.openai.com/v1/responses` по HTTP SSE. Ключ читается только из
+переменной окружения `OPENAI_API_KEY` при каждом запросе; файла credentials, входа
+OAuth и refresh нет, `status` сообщает лишь `key_present`/`key_missing`.
+HTTP 401 окончателен и не повторяется; значение ключа вырезается из ошибок.
+
+- Снято всё OAuth/Codex-специфичное: `ChatGPT-Account-Id`, originator и версия CLI,
+  `session-id`/`thread-id`/`x-client-request-id`, turn-state, `x-openai-subagent`,
+  `client_metadata`, Responses Lite и `/responses/compact`.
+- Каталог — стандартный `GET /v1/models` (только `id`): семейства `gpt-*`/`o*`
+  видимы, у reasoning-моделей допускаются все effort, проверяет их сам API.
+- `prompt_cache_options` по умолчанию `{"mode": "implicit", "ttl": "12h"}`
+  (`CODEX_AS_API_PROMPT_CACHE_TTL=off|30m|12h`). Запись 30m стоит 1,25×, 12h — 2,5×
+  цены входа, чтение одинаковое. Явные `prompt_cache_options` клиента
+  (`mode`, `ttl`, `prewarm`) передаются как есть; устаревший
+  `prompt_cache_retention` не используется.
+- `max_output_tokens` — потолок модели `CODEX_AS_API_MAX_OUTPUT_TOKENS` (по умолчанию
+  128000, `0` — не передавать) вместо клиентского `max_tokens`: это верхняя граница
+  против обрезки (`finish_reason=length`), модель останавливается сама.
+- `store:false` и зашифрованное рассуждение сохраняются, как в Legacy.
 
 ## Отдельная установка и вход
 

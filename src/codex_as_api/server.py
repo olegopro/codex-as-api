@@ -1980,6 +1980,10 @@ _RUNNING_PACKAGE_REVISION = _package_revision()
 
 
 def _health_transport_fields(provider: ChatGPTOAuthProvider) -> dict[str, Any]:
+    if getattr(provider, "backend", BACKEND) == "api":
+        return {"backend": "api", "upstream_base_url": provider.base_url, "upstream_transport": "http",
+                "package_revision": _RUNNING_PACKAGE_REVISION,
+                "prompt_cache_ttl": provider.prompt_cache_ttl, "max_output_tokens": provider.max_output_tokens}
     if getattr(provider, "backend", BACKEND) != "siwc":
         base_url = getattr(provider, "base_url", None)
         if not isinstance(base_url, str):

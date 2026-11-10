@@ -125,7 +125,7 @@ class ModelCatalogSnapshot:
     def model(self, slug: str) -> ModelCapability:
         try:
             model = self.models_by_slug[slug]
-            if self.backend == "siwc" and not model.supported_in_api:
+            if self.backend in _PUBLIC_BACKENDS and not model.supported_in_api:
                 raise ChatGPTOAuthModelNotFoundError("Модель недоступна в публичном каталоге учётной записи")
             return model
         except KeyError as exc:
@@ -138,7 +138,7 @@ class ModelCatalogSnapshot:
             if model.visibility == "list"
             and (
                 model.supported_in_api
-                if self.backend == "siwc"
+                if self.backend in _PUBLIC_BACKENDS
                 else model.slug not in _VERIFIED_HIDDEN_MODEL_SLUGS
             )
         ]
@@ -146,7 +146,7 @@ class ModelCatalogSnapshot:
             raise ChatGPTOAuthCatalogUnavailableError(
                 "upstream model catalog has no model with list visibility for default selection"
             )
-        if self.backend == "siwc":
+        if self.backend in _PUBLIC_BACKENDS:
             return visible[0]
         return min(enumerate(visible), key=lambda item: (item[1].priority, item[0]))[1]
 
@@ -276,6 +276,9 @@ def parse_model_catalog(
 ) -> ModelCatalogSnapshot:
     if not isinstance(document, dict):
         raise ChatGPTOAuthCatalogUnavailableError("model catalog response must be a JSON object")
+    if backend == "api":
+        # GET /v1/models with an API key: the standard list without per-model capabilities.
+        document = {"models": _api_catalog_models(document)}
     raw_models = document.get("models")
     if not isinstance(raw_models, list):
         raise ChatGPTOAuthCatalogUnavailableError("model catalog response must contain a models array")
@@ -287,11 +290,11 @@ def parse_model_catalog(
         model = _model_from_mapping(normalized, index=index)
         if model.slug in by_slug:
             raise ChatGPTOAuthCatalogUnavailableError("model catalog contains a duplicate model slug")
-        if backend != "siwc" and model.slug in _VERIFIED_HIDDEN_MODEL_SLUGS:
+        if backend == "codex" and model.slug in _VERIFIED_HIDDEN_MODEL_SLUGS:
             model = _promote_verified_hidden_model(model)
         by_slug[model.slug] = model
         models.append(model)
-    for fallback in (() if backend == "siwc" else _VERIFIED_HIDDEN_MODELS):
+    for fallback in (_VERIFIED_HIDDEN_MODELS if backend == "codex" else ()):
         if fallback.slug not in by_slug:
             by_slug[fallback.slug] = fallback
             models.append(fallback)
@@ -304,6 +307,45 @@ def parse_model_catalog(
         expires_at=expires_at,
         backend=backend,
     )
+
+
+_PUBLIC_BACKENDS = frozenset({"siwc", "api"})
+# The public list publishes no capabilities: reasoning efforts pass through and the API validates them.
+_API_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_API_CHAT_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+_API_REASONING_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+
+
+def _api_catalog_models(document: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Standard GET /v1/models list -> catalog mappings; ids only, nothing hidden is added."""
+    data = document.get("data")
+    if not isinstance(data, list):
+        raise ChatGPTOAuthCatalogUnavailableError("model list response must contain a data array")
+    models: list[dict[str, Any]] = []
+    for index, value in enumerate(data):
+        where = f"data[{index}]"
+        if not isinstance(value, dict):
+            raise ChatGPTOAuthCatalogUnavailableError(f"{where}: ожидается объект")
+        slug = _required_string(value, "id", where)
+        if slug != slug.strip():
+            raise ChatGPTOAuthCatalogUnavailableError(f"{where}.id: недопустимы окружающие пробелы")
+        chat = slug.startswith(_API_CHAT_PREFIXES)
+        reasoning = slug.startswith(_API_REASONING_PREFIXES)
+        models.append({
+            "slug": slug,
+            "display_name": slug,
+            "priority": index,
+            "visibility": "list" if chat else "hide",
+            "supported_in_api": True,
+            "supported_reasoning_levels": [{"effort": effort, "description": ""}
+                                           for effort in (_API_REASONING_EFFORTS if reasoning else ())],
+            "input_modalities": ["text", "image"] if chat else ["text"],
+            "support_verbosity": slug.startswith(("gpt-5", "gpt-6")),
+            "supports_reasoning_summary_parameter": reasoning,
+            "default_reasoning_summary": "auto" if reasoning else "none",
+            "use_responses_lite": False,
+        })
+    return models
 
 
 def _siwc_model_mapping(value: object, *, index: int) -> dict[str, Any]:
