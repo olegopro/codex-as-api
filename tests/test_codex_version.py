@@ -7,6 +7,7 @@ import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -190,6 +191,25 @@ def test_first_lookup_failure_raises_typed_503_error_without_fallback_or_backoff
     assert resolver.resolve() == "0.118.0"
     assert resolver.cached_version() == "0.118.0"
     assert attempts == 3
+
+
+def test_disk_cache_covers_a_cold_start_when_npm_is_slow(tmp_path: Path) -> None:
+    cache = tmp_path / "codex-cli-version.json"
+
+    def slow_fetch(_url: str, _timeout: float) -> bytes:
+        raise TimeoutError("socket timed out")
+
+    cold = CodexVersionResolver(fetch=slow_fetch, disk_cache_path=cache)
+    with pytest.raises(ChatGPTOAuthCodexVersionUnavailableError):
+        cold.resolve()
+
+    warm = CodexVersionResolver(fetch=lambda _url, _timeout: _npm_payload("0.118.0"), disk_cache_path=cache)
+    assert warm.resolve() == "0.118.0"
+    assert cache.is_file()
+
+    restarted = CodexVersionResolver(fetch=slow_fetch, disk_cache_path=cache)
+    assert restarted.resolve() == "0.118.0"
+    assert restarted.cached_version() == "0.118.0"
 
 
 def test_ttl_cache_and_expired_refresh() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 
 import pytest
@@ -438,18 +439,6 @@ class TestAnthropicRequestToInternal:
             ],
             [
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "document",
-                            "title": "Spec",
-                            "source": {"type": "text", "data": "document body"},
-                        }
-                    ],
-                }
-            ],
-            [
-                {
                     "role": "assistant",
                     "content": [
                         {
@@ -463,10 +452,104 @@ class TestAnthropicRequestToInternal:
             ],
         ],
     )
-    def test_rejects_unrepresentable_document_and_search_result_blocks(self, messages):
+    def test_rejects_unrepresentable_search_result_blocks(self, messages):
         with pytest.raises(ValueError) as exc_info:
             anthropic_request_to_internal(model="test", messages=messages)
         assert "cannot be preserved" in str(exc_info.value)
+
+    def test_document_block_inside_tool_result_degrades_to_text(self):
+        messages, *_ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {
+                                    "type": "document",
+                                    "title": "Resume",
+                                    "source": {"type": "text", "media_type": "text/plain", "data": "resume body"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+        tool_message = next(message for message in messages if message.role == MessageRole.TOOL)
+        assert "[document 'Resume'" in tool_message.content
+        assert "resume body" in tool_message.content
+
+    def test_pdf_document_block_without_text_extraction_degrades_to_note(self):
+        payload = base64.b64encode(b"%PDF-1.4 not a real pdf").decode()
+        messages, *_ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": payload,
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+        user_message = next(message for message in messages if message.role == MessageRole.USER)
+        assert "text extraction failed" in user_message.content
+
+    def test_pdf_document_block_is_extracted_with_pypdf(self):
+        pypdf = pytest.importorskip("pypdf")
+        writer = pypdf.PdfWriter()
+        page = writer.add_blank_page(width=200, height=200)
+        font = pypdf.generic.DictionaryObject(
+            {
+                pypdf.generic.NameObject("/Type"): pypdf.generic.NameObject("/Font"),
+                pypdf.generic.NameObject("/Subtype"): pypdf.generic.NameObject("/Type1"),
+                pypdf.generic.NameObject("/BaseFont"): pypdf.generic.NameObject("/Helvetica"),
+            }
+        )
+        page[pypdf.generic.NameObject("/Resources")] = pypdf.generic.DictionaryObject(
+            {
+                pypdf.generic.NameObject("/Font"): pypdf.generic.DictionaryObject(
+                    {pypdf.generic.NameObject("/F1"): writer._add_object(font)}
+                )
+            }
+        )
+        stream = pypdf.generic.DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 20 100 Td (Hello document) Tj ET")
+        page[pypdf.generic.NameObject("/Contents")] = writer._add_object(stream)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        payload = base64.b64encode(buffer.getvalue()).decode()
+        messages, *_ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": payload,
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+        user_message = next(message for message in messages if message.role == MessageRole.USER)
+        assert "Hello document" in user_message.content
 
     def test_tools_conversion(self):
         _, tools, _, _, _, _ = anthropic_request_to_internal(

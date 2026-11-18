@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -721,9 +723,84 @@ def _render_anthropic_content_block(block: dict[str, Any]) -> str:
     typ = block.get("type")
     if not isinstance(typ, str) or not typ:
         raise ValueError("Anthropic content block requires a non-empty type")
-    if typ in {"document", "search_result"}:
+    if typ == "document":
+        return _render_anthropic_document(block)
+    if typ == "search_result":
         raise ValueError(f"Anthropic content block type {typ!r} cannot be preserved by this facade")
     raise ValueError(f"Anthropic content block type {typ!r} is not supported by this facade")
+
+
+# One attachment must not brick a whole conversation: when a document cannot be
+# forwarded losslessly it degrades to text instead of returning HTTP 400. Claude
+# Code sends PDFs read by its Read tool as document blocks, and the Codex backend
+# has no lossless input for them.
+_MAX_DOCUMENT_TEXT_CHARS = 200_000
+
+
+def _render_anthropic_document(block: dict[str, Any]) -> str:
+    title = block.get("title")
+    label = f" {title!r}" if isinstance(title, str) and title.strip() else ""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("Anthropic document block requires an object source")
+    source_type = source.get("type")
+    media_type = source.get("media_type")
+    media_label = media_type if isinstance(media_type, str) and media_type else "unknown type"
+    if source_type == "text":
+        data = source.get("data")
+        if not isinstance(data, str):
+            return f"[document{label} · {media_label}; text source without string data]"
+        return f"[document{label} · {media_label}]\n{data}"
+    if source_type == "base64":
+        data = source.get("data")
+        if not isinstance(data, str) or not data:
+            return f"[document{label} · {media_label}; base64 source without data]"
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (TypeError, ValueError):
+            return f"[document{label} · {media_label}; base64 source is not valid base64]"
+        if media_type == "application/pdf":
+            text = _extract_pdf_text(raw)
+            if text:
+                return f"[document{label} · application/pdf, {len(raw)} bytes; extracted text]\n{text}"
+            return f"[document{label} · application/pdf, {len(raw)} bytes; text extraction failed]"
+        if isinstance(media_type, str) and media_type.startswith("text/"):
+            try:
+                return f"[document{label} · {media_type}]\n{raw.decode('utf-8')}"
+            except UnicodeDecodeError:
+                pass
+        return f"[document{label} · {media_label}, {len(raw)} bytes; not forwarded by this facade]"
+    if source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url:
+            return f"[document{label} · {media_label}; url source without url]"
+        return f"[document{label} · {media_label}; url not fetched by this facade: {url}]"
+    if source_type == "file":
+        return f"[document{label} · {media_label}; uploaded file not available to this facade]"
+    return f"[document{label} · {media_label}; unsupported source type {source_type!r}]"
+
+
+def _extract_pdf_text(raw: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        pieces: list[str] = []
+        total = 0
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            pieces.append(text)
+            total += len(text)
+            if total >= _MAX_DOCUMENT_TEXT_CHARS:
+                break
+    except Exception:
+        return ""
+    text = "\n".join(pieces).strip()
+    if len(text) > _MAX_DOCUMENT_TEXT_CHARS:
+        text = text[:_MAX_DOCUMENT_TEXT_CHARS].rstrip() + "\n[document text truncated by the facade]"
+    return text
 
 
 def _validate_nullable_unrepresentable_field(

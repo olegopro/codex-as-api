@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import json
 import math
+import os
+import pathlib
 import platform
 import re
 import socket
@@ -32,6 +34,10 @@ CODEX_CLI_ORIGINATOR = "codex_cli_rs"
 CODEX_VERSION_FETCH_TIMEOUT_SECONDS = 5.0
 CODEX_VERSION_CACHE_TTL_SECONDS = 3600.0
 CODEX_VERSION_RETRY_BACKOFF_SECONDS = 60.0
+# Slow routes to registry.npmjs.org made the 5 s budget fail a cold start
+# (Mini, 2026-11-18). A last-good value on disk keeps preflight and the first
+# request working; the next successful lookup replaces it.
+CODEX_VERSION_DISK_CACHE_TTL_SECONDS = 30 * 24 * 3600.0
 MAX_CODEX_VERSION_LENGTH = 64
 _MAX_METADATA_RESPONSE_BYTES = 1_048_576
 
@@ -95,6 +101,41 @@ def validate_codex_version(value: object, *, source: str = "npm @openai/codex ve
             f"{source} must be a strict stable three-component semantic version"
         )
     return value
+
+
+def default_disk_cache_path() -> pathlib.Path:
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = pathlib.Path(base) if base else pathlib.Path.home() / ".cache"
+    return root / "codex-as-api" / "codex-cli-version.json"
+
+
+def _read_disk_cached_version(path: pathlib.Path) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("version")
+    resolved_at = payload.get("resolved_at")
+    if not isinstance(version, str) or not is_valid_codex_version(version):
+        return None
+    if not isinstance(resolved_at, (int, float)) or isinstance(resolved_at, bool):
+        return None
+    if time.time() - float(resolved_at) > CODEX_VERSION_DISK_CACHE_TTL_SECONDS:
+        return None
+    return version
+
+
+def _write_disk_cached_version(path: pathlib.Path, version: str) -> None:
+    payload = json.dumps({"version": version, "resolved_at": time.time()})
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
 
 
 def require_explicit_codex_version(value: object, *, source: str = "Codex compatibility version") -> str:
@@ -309,6 +350,7 @@ class CodexVersionResolver:
         retry_backoff_seconds: float = CODEX_VERSION_RETRY_BACKOFF_SECONDS,
         timeout_seconds: float = CODEX_VERSION_FETCH_TIMEOUT_SECONDS,
         registry_url: str = CODEX_NPM_LATEST_URL,
+        disk_cache_path: pathlib.Path | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -321,6 +363,7 @@ class CodexVersionResolver:
         )
         self._timeout_seconds = _validate_positive_finite_seconds(timeout_seconds, "timeout_seconds")
         self._registry_url = _validate_registry_url(registry_url)
+        self._disk_cache_path = disk_cache_path
 
         self._last_good_version: str | None = None
         self._last_good_semver: CodexSemverTuple | None = None
@@ -338,6 +381,7 @@ class CodexVersionResolver:
         retry_backoff_seconds: float = CODEX_VERSION_RETRY_BACKOFF_SECONDS,
         timeout_seconds: float = CODEX_VERSION_FETCH_TIMEOUT_SECONDS,
         registry_url: str = CODEX_NPM_LATEST_URL,
+        disk_cache_path: pathlib.Path | None = None,
     ) -> None:
         validated_ttl = _validate_positive_finite_seconds(ttl_seconds, "ttl_seconds")
         validated_backoff = _validate_positive_finite_seconds(retry_backoff_seconds, "retry_backoff_seconds")
@@ -350,6 +394,7 @@ class CodexVersionResolver:
             self._retry_backoff_seconds = validated_backoff
             self._timeout_seconds = validated_timeout
             self._registry_url = validated_url
+            self._disk_cache_path = disk_cache_path
             self.reset()
 
     def reset(self) -> None:
@@ -472,6 +517,8 @@ class CodexVersionResolver:
                         self._last_good_semver = fetched_semver
                     self._expires_at = completed_at + self._ttl_seconds
                     self._retry_not_before = None
+                    if self._disk_cache_path is not None and self._last_good_version is not None:
+                        _write_disk_cached_version(self._disk_cache_path, self._last_good_version)
                     flight.result = self._last_good_version
                     return self._last_good_version
 
@@ -480,6 +527,14 @@ class CodexVersionResolver:
                     self._retry_not_before = self._clock() + self._retry_backoff_seconds
                     flight.result = self._last_good_version
                     return self._last_good_version
+                if self._revision == flight.revision and self._disk_cache_path is not None:
+                    cached = _read_disk_cached_version(self._disk_cache_path)
+                    if cached is not None:
+                        self._last_good_version = cached
+                        self._last_good_semver = parse_codex_semver(cached)
+                        self._retry_not_before = self._clock() + self._retry_backoff_seconds
+                        flight.result = cached
+                        return cached
 
                 flight.error = lookup_error
                 raise lookup_error
@@ -490,7 +545,7 @@ class CodexVersionResolver:
                 self._condition.notify_all()
 
 
-default_codex_version_resolver = CodexVersionResolver()
+default_codex_version_resolver = CodexVersionResolver(disk_cache_path=default_disk_cache_path())
 
 
 def resolve_codex_cli_version(
